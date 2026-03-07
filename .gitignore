@@ -1,0 +1,5 @@
+splitroute.conf
+*.tar.gz
+*.log
+*.bak
+.DS_Store

@@ -1,0 +1,16 @@
+# splitroute configuration
+# Changes take effect on the next VPN connection. No restart needed.
+
+# VPN interface detection (usually no need to change)
+# auto = detect automatically | ppp = L2TP only | utun = IKEv2/WireGuard only
+interface = auto
+
+# Proxy bridging (set to true if you use ClashX/Surge/Stash etc.)
+proxy = false
+http_port = 7890
+socks_port = 7891
+
+# === Routes (one IP or subnet per line) ===
+# Add IPs/subnets below that should go through the VPN tunnel:
+# 10.0.1.100
+# 192.168.0.0/16

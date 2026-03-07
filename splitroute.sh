@@ -1,0 +1,337 @@
+#!/bin/bash
+# splitroute — macOS VPN split tunneling CLI
+
+set -u
+
+SPLITROUTE_DIR="$HOME/.splitroute"
+CONF="$SPLITROUTE_DIR/splitroute.conf"
+LOG="/tmp/splitroute.log"
+PLIST_LABEL="com.splitroute.watch"
+PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+
+# shellcheck source=splitroute-lib.sh
+source "$SPLITROUTE_DIR/splitroute-lib.sh" 2>/dev/null || {
+    echo "splitroute is not installed. See: https://github.com/searchpcc/splitroute"
+    exit 1
+}
+
+get_version() {
+    cat "$SPLITROUTE_DIR/VERSION" 2>/dev/null || echo "unknown"
+}
+
+# --- status ---
+
+cmd_status() {
+    local ver
+    ver=$(get_version)
+    echo "splitroute v$ver"
+    echo ""
+
+    # Service status
+    if launchctl list 2>/dev/null | grep -q "$PLIST_LABEL"; then
+        echo "  Service    running"
+    else
+        echo "  Service    not running"
+    fi
+
+    # VPN status
+    local vpn_if=""
+    vpn_if=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep ppp | tail -1)
+    if [ -z "$vpn_if" ]; then
+        vpn_if=$(find_vpn_utun 2>/dev/null || true)
+    fi
+
+    if [ -n "$vpn_if" ]; then
+        local vpn_gw
+        vpn_gw=$(ifconfig "$vpn_if" 2>/dev/null | grep 'inet ' | awk '{print $4}')
+        echo "  VPN        connected ($vpn_if${vpn_gw:+, gw $vpn_gw})"
+    else
+        echo "  VPN        not connected"
+    fi
+
+    # Load config for display
+    if load_config "$CONF" 2>/dev/null; then
+        # Proxy status
+        if [ "$PROXY_ENABLED" = "true" ]; then
+            echo "  Proxy      enabled (HTTP:$HTTP_PORT SOCKS:$SOCKS_PORT)"
+        else
+            echo "  Proxy      off"
+        fi
+
+        # Routes
+        echo ""
+        if [ ${#ROUTE_IPS[@]} -eq 0 ]; then
+            echo "  Routes     (none configured)"
+            echo ""
+            echo "  Add routes: splitroute add <IP>"
+        else
+            echo "  Routes (${#ROUTE_IPS[@]}):"
+            local route_table
+            route_table=$(netstat -rn 2>/dev/null || true)
+            for entry in "${ROUTE_IPS[@]}"; do
+                if [ -n "$vpn_if" ] && echo "$route_table" | grep -qFw "$entry"; then
+                    printf "    %-24s -> %s\n" "$entry" "$vpn_if"
+                else
+                    printf "    %-24s    (inactive)\n" "$entry"
+                fi
+            done
+        fi
+    else
+        echo ""
+        echo "  Config     $CONF not found"
+        echo "  Run: splitroute edit"
+    fi
+    echo ""
+}
+
+# --- list ---
+
+cmd_list() {
+    if ! load_config "$CONF" 2>/dev/null; then
+        echo "No config file. Run: splitroute edit"
+        exit 1
+    fi
+    if [ ${#ROUTE_IPS[@]} -eq 0 ]; then
+        echo "No routes configured. Add with: splitroute add <IP>"
+        exit 0
+    fi
+    for entry in "${ROUTE_IPS[@]}"; do
+        echo "$entry"
+    done
+}
+
+# --- add ---
+
+cmd_add() {
+    local ip="${1:-}"
+    if [ -z "$ip" ]; then
+        echo "Usage: splitroute add <IP or CIDR>"
+        echo "  e.g. splitroute add 10.0.1.100"
+        echo "  e.g. splitroute add 192.168.0.0/16"
+        exit 1
+    fi
+    if ! is_valid_route "$ip"; then
+        echo "Invalid format: $ip"
+        echo "Expected: IP address (10.0.1.100) or CIDR (192.168.0.0/16)"
+        exit 1
+    fi
+
+    # Create config if it doesn't exist
+    if [ ! -f "$CONF" ]; then
+        mkdir -p "$SPLITROUTE_DIR"
+        {
+            echo "# splitroute configuration"
+            echo ""
+            echo "interface = auto"
+            echo "proxy = false"
+            echo "http_port = 7890"
+            echo "socks_port = 7891"
+            echo ""
+            echo "# === Routes ==="
+        } > "$CONF"
+    fi
+
+    if config_has_route "$ip" "$CONF"; then
+        echo "$ip is already in the config"
+        exit 0
+    fi
+
+    # Detect config format and add
+    if grep -q 'ROUTE_IPS=(' "$CONF" 2>/dev/null; then
+        # Legacy bash format: insert before closing )
+        # Find the last ) in ROUTE_IPS block and insert before it
+        sed -i '' '/^ROUTE_IPS=(/,/^)/ {
+            /^)/ i\
+\    "'"$ip"'"
+        }' "$CONF"
+    else
+        # New simple format: append to end
+        echo "$ip" >> "$CONF"
+    fi
+
+    echo "Added: $ip"
+    echo "Takes effect on next VPN connection."
+}
+
+# --- remove ---
+
+cmd_remove() {
+    local ip="${1:-}"
+    if [ -z "$ip" ]; then
+        echo "Usage: splitroute remove <IP or CIDR>"
+        exit 1
+    fi
+
+    if [ ! -f "$CONF" ]; then
+        echo "No config file found"
+        exit 1
+    fi
+
+    if ! config_has_route "$ip" "$CONF"; then
+        echo "$ip is not in the config"
+        exit 1
+    fi
+
+    if grep -q 'ROUTE_IPS=(' "$CONF" 2>/dev/null; then
+        # Legacy format: remove line containing the IP (with quotes)
+        sed -i '' "/\"$ip\"/d" "$CONF"
+    else
+        # New format: remove exact line
+        # Escape / in CIDR for sed
+        local escaped
+        escaped=$(echo "$ip" | sed 's/\//\\\//g')
+        sed -i '' "/^[[:space:]]*${escaped}[[:space:]]*$/d" "$CONF"
+    fi
+
+    echo "Removed: $ip"
+    echo "Takes effect on next VPN connection."
+}
+
+# --- edit ---
+
+cmd_edit() {
+    if [ ! -f "$CONF" ]; then
+        mkdir -p "$SPLITROUTE_DIR"
+        cp "$SPLITROUTE_DIR/../splitroute.conf.example" "$CONF" 2>/dev/null || {
+            # Generate minimal config
+            {
+                echo "# splitroute configuration"
+                echo ""
+                echo "interface = auto"
+                echo "proxy = false"
+                echo "http_port = 7890"
+                echo "socks_port = 7891"
+                echo ""
+                echo "# === Routes ==="
+            } > "$CONF"
+        }
+    fi
+    ${EDITOR:-nano} "$CONF"
+}
+
+# --- test ---
+
+cmd_test() {
+    local ip="${1:-}"
+    if [ -z "$ip" ]; then
+        echo "Usage: splitroute test <IP>"
+        echo "Check if an IP is routed through VPN."
+        exit 1
+    fi
+
+    local result iface
+    result=$(route -n get "$ip" 2>/dev/null) || {
+        echo "Cannot get route for $ip"
+        exit 1
+    }
+    iface=$(echo "$result" | grep 'interface:' | awk '{print $2}')
+
+    if [[ "$iface" == ppp* ]] || [[ "$iface" == utun* ]]; then
+        echo "$ip -> VPN ($iface)"
+    else
+        echo "$ip -> direct (${iface:-unknown})"
+        if config_has_route "$ip" "$CONF" 2>/dev/null; then
+            echo "  This IP is in your routes but VPN may not be connected."
+        else
+            echo "  Not in your routes. Add with: splitroute add $ip"
+        fi
+    fi
+}
+
+# --- logs ---
+
+cmd_logs() {
+    if [ -f "$LOG" ]; then
+        tail -20 "$LOG"
+    else
+        echo "No logs yet. Connect VPN to generate log entries."
+    fi
+}
+
+# --- version ---
+
+cmd_version() {
+    echo "splitroute $(get_version)"
+}
+
+# --- reload ---
+
+cmd_reload() {
+    if [ ! -f "$PLIST" ]; then
+        echo "splitroute is not installed"
+        exit 1
+    fi
+    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null \
+        || launchctl unload "$PLIST" 2>/dev/null || true
+    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
+        launchctl load "$PLIST"
+    fi
+    echo "Service reloaded"
+}
+
+# --- uninstall ---
+
+cmd_uninstall() {
+    echo "=== Uninstalling splitroute ==="
+    # Stop service
+    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null \
+        || launchctl unload "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    # Backup config
+    if [ -f "$CONF" ]; then
+        cp "$CONF" "$HOME/.splitroute.conf.bak"
+        echo "Config backed up to ~/.splitroute.conf.bak"
+    fi
+    # Remove install directory
+    rm -rf "$SPLITROUTE_DIR"
+    # Remove CLI and sudoers
+    sudo rm -f /usr/local/bin/splitroute
+    sudo rm -f /etc/sudoers.d/splitroute
+    echo "Done"
+}
+
+# --- help ---
+
+cmd_help() {
+    local ver
+    ver=$(get_version)
+    echo "splitroute $ver — macOS VPN split tunneling"
+    echo ""
+    echo "Usage: splitroute <command>"
+    echo ""
+    echo "Getting started:"
+    echo "  add <IP>       Add an IP or subnet to route through VPN"
+    echo "  remove <IP>    Remove an IP or subnet from routes"
+    echo "  list           List all configured routes"
+    echo "  edit           Open config file in editor"
+    echo ""
+    echo "Diagnostics:"
+    echo "  status         Show service, VPN, and route status"
+    echo "  test <IP>      Check how an IP is currently routed"
+    echo "  logs           Show recent log entries"
+    echo ""
+    echo "Management:"
+    echo "  reload         Restart the background service"
+    echo "  uninstall      Uninstall splitroute"
+    echo "  version        Show version"
+    echo "  help           Show this help"
+    echo ""
+    echo "Config: $CONF"
+}
+
+# --- main ---
+
+case "${1:-help}" in
+    status)               cmd_status ;;
+    list|ls)              cmd_list ;;
+    add)                  cmd_add "${2:-}" ;;
+    remove|rm)            cmd_remove "${2:-}" ;;
+    edit)                 cmd_edit ;;
+    test)                 cmd_test "${2:-}" ;;
+    logs|log)             cmd_logs ;;
+    version|--version|-v) cmd_version ;;
+    reload)               cmd_reload ;;
+    uninstall)            cmd_uninstall ;;
+    help|--help|-h)       cmd_help ;;
+    *)                    echo "Unknown command: $1"; echo ""; cmd_help; exit 1 ;;
+esac
