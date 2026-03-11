@@ -105,3 +105,51 @@ config_has_route() {
 is_valid_route() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]
 }
+
+# Return current VPN interface name (e.g. utun3, ppp0), or empty if none.
+# Checks ppp first, then scutil, then utun with P2P heuristic.
+get_vpn_interface() {
+    local iface
+    # L2TP creates ppp interfaces
+    iface=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep ppp | tail -1)
+    if [ -n "$iface" ]; then
+        echo "$iface"
+        return 0
+    fi
+    # System VPN (IKEv2, L2TP via macOS settings) — find associated utun
+    if scutil --nc list 2>/dev/null | grep -q Connected; then
+        iface=$(find_vpn_utun 2>/dev/null || true)
+        if [ -n "$iface" ]; then
+            echo "$iface"
+            return 0
+        fi
+    fi
+    # Third-party VPN apps (WireGuard, Tunnelblick, OpenVPN)
+    iface=$(find_vpn_utun 2>/dev/null || true)
+    if [ -n "$iface" ]; then
+        echo "$iface"
+        return 0
+    fi
+    return 1
+}
+
+# Verify that at least one configured route exists on the given interface.
+# Returns 0 if at least one route points to the correct interface, 1 otherwise.
+verify_routes() {
+    local expected_if="$1"
+    local route_table
+    route_table=$(netstat -rn 2>/dev/null) || return 1
+
+    # Need config loaded
+    if [ ${#ROUTE_IPS[@]} -eq 0 ]; then
+        return 1
+    fi
+
+    for entry in "${ROUTE_IPS[@]}"; do
+        # Check if this route exists AND points to the expected interface
+        if echo "$route_table" | grep -Fw "$entry" | grep -qw "$expected_if"; then
+            return 0
+        fi
+    done
+    return 1
+}

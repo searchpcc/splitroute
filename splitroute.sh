@@ -36,10 +36,7 @@ cmd_status() {
 
     # VPN status
     local vpn_if=""
-    vpn_if=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep ppp | tail -1)
-    if [ -z "$vpn_if" ]; then
-        vpn_if=$(find_vpn_utun 2>/dev/null || true)
-    fi
+    vpn_if=$(get_vpn_interface 2>/dev/null || true)
 
     if [ -n "$vpn_if" ]; then
         local vpn_gw
@@ -69,8 +66,13 @@ cmd_status() {
             local route_table
             route_table=$(netstat -rn 2>/dev/null || true)
             for entry in "${ROUTE_IPS[@]}"; do
-                if [ -n "$vpn_if" ] && echo "$route_table" | grep -qFw "$entry"; then
-                    printf "    %-24s -> %s\n" "$entry" "$vpn_if"
+                if [ -n "$vpn_if" ] && echo "$route_table" | grep -Fw "$entry" | grep -qw "$vpn_if"; then
+                    printf "    %-24s -> %-8s [OK]\n" "$entry" "$vpn_if"
+                elif echo "$route_table" | grep -qFw "$entry"; then
+                    # Route exists but points to wrong/old interface
+                    local actual_if
+                    actual_if=$(echo "$route_table" | grep -Fw "$entry" | awk '{print $NF}' | head -1)
+                    printf "    %-24s -> %-8s [STALE]\n" "$entry" "$actual_if"
                 else
                     printf "    %-24s    (inactive)\n" "$entry"
                 fi
@@ -290,6 +292,139 @@ cmd_uninstall() {
     echo "Done"
 }
 
+# --- doctor ---
+
+cmd_doctor() {
+    local fix=false
+    if [ "${1:-}" = "--fix" ]; then
+        fix=true
+    fi
+
+    local pass=0 fail=0 warn=0
+
+    # 1. Daemon check
+    printf "  [1/5] Daemon .............. "
+    if launchctl list 2>/dev/null | grep -q "$PLIST_LABEL"; then
+        echo "running"
+        pass=$((pass + 1))
+    else
+        echo "NOT running"
+        fail=$((fail + 1))
+        if $fix && [ -f "$PLIST" ]; then
+            echo "        -> Fixing: restarting service"
+            cmd_reload
+        fi
+    fi
+
+    # 2. Config check
+    printf "  [2/5] Config .............. "
+    if load_config "$CONF" 2>/dev/null && [ ${#ROUTE_IPS[@]} -gt 0 ]; then
+        echo "ok (${#ROUTE_IPS[@]} routes)"
+        pass=$((pass + 1))
+    elif [ ! -f "$CONF" ]; then
+        echo "MISSING ($CONF)"
+        fail=$((fail + 1))
+        echo "        -> Run: splitroute edit"
+    else
+        echo "no routes configured"
+        warn=$((warn + 1))
+        echo "        -> Run: splitroute add <IP>"
+    fi
+
+    # 3. VPN check
+    printf "  [3/5] VPN ................. "
+    local vpn_if
+    vpn_if=$(get_vpn_interface 2>/dev/null || true)
+    if [ -n "$vpn_if" ]; then
+        echo "connected ($vpn_if)"
+        pass=$((pass + 1))
+    else
+        echo "NOT connected"
+        fail=$((fail + 1))
+        echo "        -> Connect your VPN first"
+    fi
+
+    # 4. Route table verification
+    printf "  [4/5] Routes .............. "
+    if [ -z "$vpn_if" ] || [ ${#ROUTE_IPS[@]} -eq 0 ]; then
+        echo "skipped (no VPN or no routes)"
+        warn=$((warn + 1))
+    else
+        local route_table ok_count stale_count missing_count
+        route_table=$(netstat -rn 2>/dev/null || true)
+        ok_count=0
+        stale_count=0
+        missing_count=0
+        for entry in "${ROUTE_IPS[@]}"; do
+            if echo "$route_table" | grep -Fw "$entry" | grep -qw "$vpn_if"; then
+                ok_count=$((ok_count + 1))
+            elif echo "$route_table" | grep -qFw "$entry"; then
+                stale_count=$((stale_count + 1))
+            else
+                missing_count=$((missing_count + 1))
+            fi
+        done
+        if [ $stale_count -eq 0 ] && [ $missing_count -eq 0 ]; then
+            echo "all ${ok_count} routes OK on $vpn_if"
+            pass=$((pass + 1))
+        else
+            echo "${ok_count} ok, ${stale_count} stale, ${missing_count} missing"
+            fail=$((fail + 1))
+            if $fix; then
+                echo "        -> Fixing: re-applying routes"
+                bash "$SPLITROUTE_DIR/splitroute-routes.sh" 2>/dev/null
+            else
+                echo "        -> Run: splitroute doctor --fix"
+            fi
+        fi
+    fi
+
+    # 5. Connectivity test (first route)
+    printf "  [5/5] Connectivity ........ "
+    if [ -z "$vpn_if" ] || [ ${#ROUTE_IPS[@]} -eq 0 ]; then
+        echo "skipped"
+        warn=$((warn + 1))
+    else
+        local test_ip="${ROUTE_IPS[0]}"
+        # Strip CIDR for ping test
+        test_ip="${test_ip%%/*}"
+        local result_if
+        result_if=$(route -n get "$test_ip" 2>/dev/null | grep 'interface:' | awk '{print $2}')
+        if [ "$result_if" = "$vpn_if" ]; then
+            echo "ok ($test_ip -> $vpn_if)"
+            pass=$((pass + 1))
+        else
+            echo "$test_ip -> ${result_if:-unknown} (expected $vpn_if)"
+            fail=$((fail + 1))
+        fi
+    fi
+
+    echo ""
+    echo "  Result: $pass passed, $fail failed, $warn skipped"
+    if [ $fail -gt 0 ] && ! $fix; then
+        echo "  Run 'splitroute doctor --fix' to attempt auto-repair"
+    fi
+    return $fail
+}
+
+# --- apply ---
+
+cmd_apply() {
+    local vpn_if
+    vpn_if=$(get_vpn_interface 2>/dev/null || true)
+    if [ -z "$vpn_if" ]; then
+        echo "No VPN connection detected"
+        exit 1
+    fi
+    echo "Applying routes on $vpn_if ..."
+    if bash "$SPLITROUTE_DIR/splitroute-routes.sh"; then
+        echo "Done. Run 'splitroute status' to verify."
+    else
+        echo "Route script exited with error. Check: splitroute logs"
+        exit 1
+    fi
+}
+
 # --- help ---
 
 cmd_help() {
@@ -307,10 +442,12 @@ cmd_help() {
     echo ""
     echo "Diagnostics:"
     echo "  status         Show service, VPN, and route status"
+    echo "  doctor [--fix] Run 5-step diagnostic (optional auto-fix)"
     echo "  test <IP>      Check how an IP is currently routed"
     echo "  logs           Show recent log entries"
     echo ""
     echo "Management:"
+    echo "  apply          Manually inject routes now"
     echo "  reload         Restart the background service"
     echo "  uninstall      Uninstall splitroute"
     echo "  version        Show version"
@@ -328,6 +465,8 @@ case "${1:-help}" in
     remove|rm)            cmd_remove "${2:-}" ;;
     edit)                 cmd_edit ;;
     test)                 cmd_test "${2:-}" ;;
+    doctor)               cmd_doctor "${2:-}" ;;
+    apply)                cmd_apply ;;
     logs|log)             cmd_logs ;;
     version|--version|-v) cmd_version ;;
     reload)               cmd_reload ;;
