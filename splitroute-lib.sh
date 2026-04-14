@@ -9,6 +9,27 @@ SPLITROUTE_LOG="/tmp/splitroute.log"
 # Formatted timestamp for log entries
 log_ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 
+# Wait for a launchd service to finish unloading after `launchctl bootout`.
+# bootout is asynchronous — it signals SIGTERM and returns immediately, but
+# the service label stays bootstrapped until the process actually exits.
+# Calling `launchctl bootstrap` before that completes fails with
+# "Load failed: 5: Input/output error" (EIO). This helper polls
+# `launchctl print` until the label is gone, or times out after ~5 seconds.
+# Returns 0 when unloaded, 1 on timeout.
+launchd_wait_unload() {
+    local label="$1"
+    local domain="${2:-gui/$(id -u)}"
+    local i=0
+    while launchctl print "$domain/$label" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -ge 50 ]; then
+            return 1
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+
 # Find a utun interface that belongs to a VPN (has point-to-point inet address)
 # System utun interfaces (iCloud Private Relay, etc.) do not have P2P inet.
 find_vpn_utun() {

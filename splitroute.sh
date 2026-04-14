@@ -263,12 +263,21 @@ cmd_reload() {
         echo "splitroute is not installed"
         exit 1
     fi
-    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null \
+    local domain="gui/$(id -u)"
+    launchctl bootout "$domain/$PLIST_LABEL" 2>/dev/null \
         || launchctl unload "$PLIST" 2>/dev/null || true
-    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
-        launchctl load "$PLIST"
+    # bootout is async — wait for the label to actually be gone before
+    # bootstrap, otherwise launchd returns EIO (Input/output error).
+    launchd_wait_unload "$PLIST_LABEL" "$domain" || true
+    if launchctl bootstrap "$domain" "$PLIST" 2>/dev/null; then
+        echo "Service reloaded"
+    elif launchctl load "$PLIST" 2>/dev/null; then
+        echo "Service reloaded (legacy API)"
+    else
+        echo "Reload failed — service may still be shutting down. Retry in a moment,"
+        echo "or run 'splitroute doctor' for diagnostics."
+        return 1
     fi
-    echo "Service reloaded"
 }
 
 # --- uninstall ---
@@ -276,8 +285,10 @@ cmd_reload() {
 cmd_uninstall() {
     echo "=== Uninstalling splitroute ==="
     # Stop service
-    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null \
+    local domain="gui/$(id -u)"
+    launchctl bootout "$domain/$PLIST_LABEL" 2>/dev/null \
         || launchctl unload "$PLIST" 2>/dev/null || true
+    launchd_wait_unload "$PLIST_LABEL" "$domain" || true
     rm -f "$PLIST"
     # Backup config
     if [ -f "$CONF" ]; then

@@ -144,6 +144,12 @@ launchctl bootout "gui/$USER_UID/$PLIST_LABEL" 2>/dev/null \
     || launchctl unload "$PLIST" 2>/dev/null \
     || true
 
+# bootout is async — wait for the label to actually be gone before
+# bootstrap, otherwise launchd returns EIO (Input/output error).
+# shellcheck source=splitroute-lib.sh
+source "$INSTALL_DIR/splitroute-lib.sh"
+launchd_wait_unload "$PLIST_LABEL" "gui/$USER_UID" || true
+
 # Load service (try new API first, fallback to legacy)
 if ! launchctl bootstrap "gui/$USER_UID" "$PLIST" 2>/dev/null; then
     launchctl load "$PLIST"
