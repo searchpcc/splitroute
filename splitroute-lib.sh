@@ -1,5 +1,6 @@
 #!/bin/bash
 # splitroute-lib.sh — Shared functions and constants for splitroute
+# shellcheck disable=SC2034  # SPLITROUTE_LOG is consumed by sourcing scripts (routes, watch)
 
 SPLITROUTE_DIR="$HOME/.splitroute"
 SPLITROUTE_CONF="$SPLITROUTE_DIR/splitroute.conf"
