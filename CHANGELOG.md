@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1] - 2026-04-14
+
+### Fixed
+
+- `splitroute reload` intermittently failed with `Load failed: 5: Input/output error` and often needed 2–3 retries. Root cause: `launchctl bootout` is asynchronous — it signals SIGTERM and returns before the service actually exits, so the immediately-following `launchctl bootstrap` hit an already-bootstrapped label and returned EIO. Now `reload`, `uninstall`, and the installer poll `launchctl print` until the label is gone (timeout 5s) before bootstrapping
+- `splitroute reload` printed "Service reloaded" even when both the new and legacy load APIs failed. It now only reports success when the service actually loaded, and prints an actionable error otherwise (exit code 1)
+
 ## [1.2.0] - 2026-04-14
 
 ### Added
