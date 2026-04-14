@@ -263,7 +263,8 @@ cmd_reload() {
         echo "splitroute is not installed"
         exit 1
     fi
-    local domain="gui/$(id -u)"
+    local domain
+    domain="gui/$(id -u)"
     launchctl bootout "$domain/$PLIST_LABEL" 2>/dev/null \
         || launchctl unload "$PLIST" 2>/dev/null || true
     # bootout is async — wait for the label to actually be gone before
@@ -285,7 +286,8 @@ cmd_reload() {
 cmd_uninstall() {
     echo "=== Uninstalling splitroute ==="
     # Stop service
-    local domain="gui/$(id -u)"
+    local domain
+    domain="gui/$(id -u)"
     launchctl bootout "$domain/$PLIST_LABEL" 2>/dev/null \
         || launchctl unload "$PLIST" 2>/dev/null || true
     launchd_wait_unload "$PLIST_LABEL" "$domain" || true
