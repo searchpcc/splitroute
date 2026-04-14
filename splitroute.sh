@@ -303,7 +303,7 @@ cmd_doctor() {
     local pass=0 fail=0 warn=0
 
     # 1. Daemon check
-    printf "  [1/5] Daemon .............. "
+    printf "  [1/6] Daemon .............. "
     if launchctl list 2>/dev/null | grep -q "$PLIST_LABEL"; then
         echo "running"
         pass=$((pass + 1))
@@ -317,7 +317,7 @@ cmd_doctor() {
     fi
 
     # 2. Config check
-    printf "  [2/5] Config .............. "
+    printf "  [2/6] Config .............. "
     if load_config "$CONF" 2>/dev/null && [ ${#ROUTE_IPS[@]} -gt 0 ]; then
         echo "ok (${#ROUTE_IPS[@]} routes)"
         pass=$((pass + 1))
@@ -332,7 +332,7 @@ cmd_doctor() {
     fi
 
     # 3. VPN check
-    printf "  [3/5] VPN ................. "
+    printf "  [3/6] VPN ................. "
     local vpn_if
     vpn_if=$(get_vpn_interface 2>/dev/null || true)
     if [ -n "$vpn_if" ]; then
@@ -345,7 +345,7 @@ cmd_doctor() {
     fi
 
     # 4. Route table verification
-    printf "  [4/5] Routes .............. "
+    printf "  [4/6] Routes .............. "
     if [ -z "$vpn_if" ] || [ ${#ROUTE_IPS[@]} -eq 0 ]; then
         echo "skipped (no VPN or no routes)"
         warn=$((warn + 1))
@@ -380,7 +380,7 @@ cmd_doctor() {
     fi
 
     # 5. Connectivity test (first route)
-    printf "  [5/5] Connectivity ........ "
+    printf "  [5/6] Connectivity ........ "
     if [ -z "$vpn_if" ] || [ ${#ROUTE_IPS[@]} -eq 0 ]; then
         echo "skipped"
         warn=$((warn + 1))
@@ -396,6 +396,34 @@ cmd_doctor() {
         else
             echo "$test_ip -> ${result_if:-unknown} (expected $vpn_if)"
             fail=$((fail + 1))
+        fi
+    fi
+
+    # 6. Proxy listener (only when proxy bridging is enabled)
+    printf "  [6/6] Proxy listener ...... "
+    if [ "$PROXY_ENABLED" != "true" ]; then
+        echo "skipped (proxy bridging disabled)"
+        warn=$((warn + 1))
+    else
+        local ports_to_check
+        if [ "$HTTP_PORT" = "$SOCKS_PORT" ]; then
+            ports_to_check="$HTTP_PORT"
+        else
+            ports_to_check="$HTTP_PORT $SOCKS_PORT"
+        fi
+        local missing=()
+        for p in $ports_to_check; do
+            if ! nc -z -G 1 127.0.0.1 "$p" 2>/dev/null; then
+                missing+=("$p")
+            fi
+        done
+        if [ ${#missing[@]} -eq 0 ]; then
+            echo "ok ($ports_to_check listening)"
+            pass=$((pass + 1))
+        else
+            echo "no listener on ${missing[*]}"
+            fail=$((fail + 1))
+            echo "        -> Start your proxy tool, or run 'splitroute edit' to adjust ports"
         fi
     fi
 
