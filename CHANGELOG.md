@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.2.0] - 2026-04-14
+
+### Added
+
+- `splitroute doctor` now includes a 6th step, `Proxy listener`: when `proxy = true`, probes the configured HTTP/SOCKS ports on `127.0.0.1` and reports whether the proxy tool is actually running. Handles mixed-port configs (e.g. Clash Verge `7897`) by only probing once when HTTP and SOCKS ports match
+- Interactive installer prints a proxy-port reference table (ClashX Meta / Stash, Clash Verge, Surge) before prompting for ports, so users can pick the right port for their proxy tool without leaving the terminal
+
+## [1.1.0] - 2026-03-11
+
+### Added
+
+- `splitroute doctor [--fix]`: 5-step diagnostic (daemon, config, VPN, routes, connectivity) with optional auto-repair
+- `splitroute apply`: manually inject routes without waiting for the watch daemon
+- `[OK]`/`[STALE]` per-route markers in `splitroute status`
+- Periodic route verification every 30s in the watch daemon as a safety net
+
+### Fixed
+
+- VPN reconnect route loss: the watch daemon now tracks the specific VPN interface name (e.g. `utun3`) instead of only checking "is VPN connected", so routes are re-applied when the interface changes across reconnects (e.g. `utun3` → `utun5`)
+
 ## [1.0.0] - 2026-03-07
 
 ### Added
