@@ -79,6 +79,12 @@ else
         P_SOCKS="7891"
         if [[ "$use_proxy" =~ ^[Yy] ]]; then
             PROXY_ENABLED="true"
+            echo ""
+            echo "  Common proxy ports:"
+            echo "    ClashX Meta / Stash  -> HTTP 7890, SOCKS 7891"
+            echo "    Clash Verge          -> HTTP 7897, SOCKS 7897 (mixed)"
+            echo "    Surge                -> HTTP 6152, SOCKS 6153"
+            echo ""
             read -rp "  HTTP proxy port [7890]: " p_http
             [ -n "$p_http" ] && P_HTTP="$p_http"
             read -rp "  SOCKS proxy port [7891]: " p_socks
