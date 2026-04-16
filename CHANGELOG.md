@@ -1,10 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [1.4.0] - 2026-04-17
 
 ### Added
 
-- `splitroute domain add` now accepts an IPv4 address or CIDR. Such entries generate only a PAC `isInNet` DIRECT rule — no macOS route is installed. Use this when the VPN client already owns the route and you just want the browser to bypass the upstream proxy. `splitroute add` is still the right command when non-browser traffic (SSH/curl/etc.) needs the IP routed via VPN. `splitroute domain list` now prints domain patterns and PAC-only IPs in separate sections.
+- `splitroute domain add` now accepts an IPv4 address or CIDR. Such entries generate only a PAC `isInNet` DIRECT rule — no macOS route is installed. Useful when the VPN client already owns the route for that IP/subnet (e.g. internal CIDRs pushed via IKEv2 / WireGuard AllowedIPs, or full-tunnel VPN) and you only need the browser to stop handing those requests to the upstream proxy (Clash Verge etc.). For the common case where splitroute must install the VPN route itself, keep using `splitroute add <IP>` — it writes both the macOS route and the PAC entry. `splitroute domain list` now prints domain patterns and PAC-only IPs in separate sections, and `status` / `doctor` / `pac show` counters include PAC-only IPs alongside domains.
 
 ### Fixed
 
