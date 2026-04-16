@@ -95,7 +95,7 @@ cmd_status() {
                 pac_running=yes
                 pac_pid=$(cat "$SPLITROUTE_PAC_PID" 2>/dev/null)
             fi
-            echo "  PAC        enabled (port $PAC_PORT, ${#DOMAINS[@]} domain, ${#DNS_SUFFIXES[@]} dns)"
+            echo "  PAC        enabled (port $PAC_PORT, ${#DOMAINS[@]} domain, ${#DOMAIN_IPS[@]} ip, ${#DNS_SUFFIXES[@]} dns)"
             echo "    URL      $(pac_url)"
             if [ "$pac_running" = "yes" ]; then
                 echo "    Server   running (pid $pac_pid)"
@@ -105,6 +105,12 @@ cmd_status() {
             if [ "${#DOMAINS[@]}" -gt 0 ]; then
                 echo "    Domains:"
                 for d in "${DOMAINS[@]}"; do
+                    echo "      $d"
+                done
+            fi
+            if [ "${#DOMAIN_IPS[@]}" -gt 0 ]; then
+                echo "    IPs (PAC-only):"
+                for d in "${DOMAIN_IPS[@]}"; do
                     echo "      $d"
                 done
             fi
@@ -518,7 +524,7 @@ cmd_doctor() {
                 fi
             done < <(active_network_services)
             if [ -n "$any_svc" ]; then
-                echo "ok (${#DOMAINS[@]} domain, ${#DNS_SUFFIXES[@]} dns)"
+                echo "ok (${#DOMAINS[@]} domain, ${#DOMAIN_IPS[@]} ip, ${#DNS_SUFFIXES[@]} dns)"
                 pass=$((pass + 1))
             else
                 echo "autoproxy not set on any service"
@@ -598,26 +604,30 @@ cmd_domain() {
         remove|rm|r)  _cmd_domain_remove "${1:-}" ;;
         list|ls|"")   _cmd_domain_list ;;
         *)
-            echo "Usage: splitroute domain {add|remove|list} [pattern]"
+            echo "Usage: splitroute domain {add|remove|list} [pattern-or-IP]"
             exit 1 ;;
     esac
 }
 
 _cmd_domain_add() {
     local pattern="${1:-}"
-    [ -z "$pattern" ] && { echo "Usage: splitroute domain add <pattern>"; exit 1; }
+    [ -z "$pattern" ] && { echo "Usage: splitroute domain add <pattern-or-IP>"; exit 1; }
     _require_new_format
     _ensure_conf
     load_config "$CONF" 2>/dev/null || true
     local d
-    for d in "${DOMAINS[@]+"${DOMAINS[@]}"}"; do
+    for d in "${DOMAINS[@]+"${DOMAINS[@]}"}" "${DOMAIN_IPS[@]+"${DOMAIN_IPS[@]}"}"; do
         if [ "$d" = "$pattern" ]; then
             echo "Already present: $pattern"
             exit 0
         fi
     done
     echo "domain: $pattern" >> "$CONF"
-    echo "Added domain: $pattern"
+    if is_valid_route "$pattern"; then
+        echo "Added domain IP: $pattern (PAC-only; use \`splitroute add\` if you also need a route)"
+    else
+        echo "Added domain: $pattern"
+    fi
     echo "Takes effect within 30s (watch hot-reloads config)."
 }
 
@@ -646,14 +656,24 @@ _cmd_domain_remove() {
 
 _cmd_domain_list() {
     load_config "$CONF" 2>/dev/null || { echo "No config"; return; }
-    if [ "${#DOMAINS[@]}" -eq 0 ]; then
+    if [ "${#DOMAINS[@]}" -eq 0 ] && [ "${#DOMAIN_IPS[@]}" -eq 0 ]; then
         echo "(no domain rules)"
         return
     fi
     local d
-    for d in "${DOMAINS[@]}"; do
-        echo "$d"
-    done
+    if [ "${#DOMAINS[@]}" -gt 0 ]; then
+        echo "# Domain patterns (PAC shExpMatch)"
+        for d in "${DOMAINS[@]}"; do
+            echo "$d"
+        done
+    fi
+    if [ "${#DOMAIN_IPS[@]}" -gt 0 ]; then
+        [ "${#DOMAINS[@]}" -gt 0 ] && echo ""
+        echo "# IP rules (PAC isInNet, no macOS route)"
+        for d in "${DOMAIN_IPS[@]}"; do
+            echo "$d"
+        done
+    fi
 }
 
 # --- dns ---
@@ -753,6 +773,7 @@ cmd_pac() {
                     echo "Server:  NOT running"
                 fi
                 echo "Domains: ${#DOMAINS[@]}"
+                echo "IPs:     ${#DOMAIN_IPS[@]} (PAC-only)"
                 echo "DNS:     ${#DNS_SUFFIXES[@]}"
             else
                 echo "PAC disabled (add 'domain:' or 'dns:' lines to enable)"
@@ -780,9 +801,9 @@ cmd_help() {
     echo "  edit                  Open config file in editor"
     echo ""
     echo "Browser split routing (PAC):"
-    echo "  domain add <pat>      Add a domain pattern (e.g. *.company.com) to route via VPN"
-    echo "  domain remove <pat>   Remove a domain pattern"
-    echo "  domain list           List domain patterns"
+    echo "  domain add <pat|IP>   Add a domain pattern or IPv4/CIDR (browser via VPN; PAC only)"
+    echo "  domain remove <pat>   Remove a domain pattern or IP"
+    echo "  domain list           List domain patterns and PAC-only IPs"
     echo "  dns add <suffix> [ns] Map an internal DNS suffix to a nameserver (or 'auto')"
     echo "  dns remove <suffix>   Remove a DNS override"
     echo "  dns list              List DNS overrides"

@@ -3,7 +3,7 @@
 #
 # Sourced by splitroute-watch.sh. Not executable on its own.
 # Depends on variables set by load_config() in splitroute-lib.sh:
-#   DOMAINS, ROUTE_IPS, PAC_PORT, UPSTREAM_PROXY
+#   DOMAINS, DOMAIN_IPS, ROUTE_IPS, PAC_PORT, UPSTREAM_PROXY
 # And path constants:
 #   SPLITROUTE_PAC_DIR, SPLITROUTE_PAC_FILE, SPLITROUTE_PAC_PID, SPLITROUTE_LOG
 
@@ -30,10 +30,18 @@ pac_rewrite() {
             done
         fi
 
-        # IP/CIDR rules (isInNet)
+        # IP/CIDR rules (isInNet) — sourced from both ROUTE_IPS (route table + PAC)
+        # and DOMAIN_IPS (PAC only, declared via `domain:` lines).
+        local ip_rules=()
         if [ ${#ROUTE_IPS[@]} -gt 0 ]; then
+            ip_rules+=("${ROUTE_IPS[@]}")
+        fi
+        if [ ${#DOMAIN_IPS[@]} -gt 0 ]; then
+            ip_rules+=("${DOMAIN_IPS[@]}")
+        fi
+        if [ ${#ip_rules[@]} -gt 0 ]; then
             echo '  if (/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/.test(host)) {'
-            for cidr in "${ROUTE_IPS[@]}"; do
+            for cidr in "${ip_rules[@]}"; do
                 if ! pair=$(cidr_to_netmask "$cidr" 2>/dev/null); then
                     continue
                 fi

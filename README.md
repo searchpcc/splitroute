@@ -92,9 +92,9 @@ splitroute uninstall             Uninstall splitroute
 splitroute help                  Show all commands
 
 # Browser split routing (PAC) — see section below
-splitroute domain add <pattern>  Send a domain (e.g. *.company.com) through VPN
-splitroute domain remove <pat>   Remove a domain pattern
-splitroute domain list           List domain patterns
+splitroute domain add <pat|IP>   Domain pattern (*.company.com) OR IPv4/CIDR for browser
+splitroute domain remove <pat>   Remove a domain pattern or PAC-only IP
+splitroute domain list           List domain patterns and PAC-only IPs
 splitroute dns add <sfx> [ns]    Map a DNS suffix to a nameserver (or 'auto')
 splitroute dns remove <sfx>      Remove a DNS override
 splitroute dns list              List DNS overrides
@@ -167,6 +167,12 @@ Clash configuration is **not** modified.
 # Domains whose traffic should go via VPN in the browser
 splitroute domain add '*.company.com'
 splitroute domain add '*.corp.internal'
+
+# IP / CIDR for browser only (PAC `isInNet` DIRECT, no macOS route installed).
+# Use this when the VPN client already routes the IP; if SSH/curl also need
+# it via VPN, use `splitroute add <IP>` instead (writes macOS route + PAC).
+splitroute domain add 10.0.1.5
+splitroute domain add 10.0.2.0/24
 
 # Internal DNS override (so DIRECT hostnames resolve via VPN-pushed DNS).
 # 'auto' reads the nameserver from scutil --dns once VPN is connected.

@@ -60,7 +60,7 @@ trim() {
 
 # Load config file (supports both new simple format and legacy bash format)
 # Sets: ROUTE_IPS, VPN_INTERFACE, PROXY_ENABLED, HTTP_PORT, SOCKS_PORT,
-#       DOMAINS, DNS_SUFFIXES, DNS_NAMESERVERS, PAC_ENABLED, PAC_PORT,
+#       DOMAINS, DOMAIN_IPS, DNS_SUFFIXES, DNS_NAMESERVERS, PAC_ENABLED, PAC_PORT,
 #       UPSTREAM_PROXY, MANAGE_RESOLVER, AUTO_SET_SYSTEM_PROXY
 load_config() {
     local conf="${1:-$SPLITROUTE_CONF}"
@@ -74,6 +74,7 @@ load_config() {
 
     # PAC subsystem defaults (v1: browser-friendly split routing via PAC)
     DOMAINS=()
+    DOMAIN_IPS=()        # IPv4/CIDR declared via `domain:` — PAC isInNet only, no route
     DNS_SUFFIXES=()
     DNS_NAMESERVERS=()   # parallel to DNS_SUFFIXES (value may be "auto")
     PAC_ENABLED="auto"   # auto = enabled when at least one domain/dns line is present
@@ -108,7 +109,13 @@ load_config() {
         # Prefixed rule lines
         if [[ "$line" == domain:* ]]; then
             rest="$(trim "${line#domain:}")"
-            [ -n "$rest" ] && DOMAINS+=("$rest")
+            if [ -n "$rest" ]; then
+                if is_valid_route "$rest"; then
+                    DOMAIN_IPS+=("$rest")
+                else
+                    DOMAINS+=("$rest")
+                fi
+            fi
             continue
         fi
         if [[ "$line" == dns:* ]]; then
@@ -143,9 +150,9 @@ load_config() {
         fi
     done < "$conf"
 
-    # Resolve PAC_ENABLED=auto → true when any domain/dns rule is present
+    # Resolve PAC_ENABLED=auto → true when any domain/domain-ip/dns rule is present
     if [ "$PAC_ENABLED" = "auto" ]; then
-        if [ ${#DOMAINS[@]} -gt 0 ] || [ ${#DNS_SUFFIXES[@]} -gt 0 ]; then
+        if [ ${#DOMAINS[@]} -gt 0 ] || [ ${#DOMAIN_IPS[@]} -gt 0 ] || [ ${#DNS_SUFFIXES[@]} -gt 0 ]; then
             PAC_ENABLED="true"
         else
             PAC_ENABLED="false"

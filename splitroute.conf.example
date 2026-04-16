@@ -29,6 +29,14 @@ socks_port = 7891
 # Requires DNS for these domains to be resolvable; see `dns:` below.
 # domain: *.company.com
 # domain: *.corp.internal
+#
+# `domain:` also accepts an IPv4 address or CIDR. Those entries generate PAC
+# `isInNet` rules only — they do NOT add a macOS route. Use this when the VPN
+# client already installs the route and you only need the browser to bypass the
+# upstream proxy. If you also need non-browser traffic (SSH, curl) routed via
+# VPN, add it as a plain `Routes` entry at the top of the file.
+# domain: 10.0.1.5
+# domain: 10.0.2.0/24
 
 # === Internal DNS overrides (written to /etc/resolver/<suffix>) ===
 # Format: dns: <suffix> [<nameserver-ip> | auto]
