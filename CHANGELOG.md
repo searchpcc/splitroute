@@ -1,5 +1,7 @@
 # Changelog
 
+> 中文版：[CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)
+
 ## [1.4.0] - 2026-04-17
 
 ### Added
