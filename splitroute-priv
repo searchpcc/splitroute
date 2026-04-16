@@ -1,0 +1,100 @@
+#!/bin/bash
+# splitroute-priv — privileged helper for splitroute
+#
+# Runs as root via /etc/sudoers.d/splitroute (NOPASSWD). Keeps the
+# privileged surface small: only manages /etc/resolver/<suffix> files
+# that carry the splitroute marker.
+#
+# Subcommands:
+#   write-resolver  <suffix> <nameserver>
+#   delete-resolver <suffix>
+#   cleanup-resolver                          # delete all marked files
+#   list-resolver                             # list marked files (for debug)
+
+set -eu
+
+MARKER="# managed-by: splitroute"
+RESOLVER_DIR="/etc/resolver"
+
+die() {
+    echo "splitroute-priv: $*" >&2
+    exit 1
+}
+
+# Reject anything that isn't a DNS-safe suffix. No slashes, no leading dots,
+# no "..". This blocks path traversal in /etc/resolver/.
+valid_suffix() {
+    local s="$1"
+    [ -n "$s" ] || return 1
+    [[ "$s" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,252}[a-zA-Z0-9])?$ ]] || return 1
+    [[ "$s" == *..* ]] && return 1
+    return 0
+}
+
+valid_nameserver() {
+    local ns="$1"
+    [[ "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    return 0
+}
+
+marked_file() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    head -1 "$f" 2>/dev/null | grep -qxF "$MARKER"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    write-resolver)
+        suffix="${1:-}"
+        ns="${2:-}"
+        valid_suffix "$suffix"      || die "invalid suffix: $suffix"
+        valid_nameserver "$ns"      || die "invalid nameserver: $ns"
+        mkdir -p "$RESOLVER_DIR"
+        chmod 755 "$RESOLVER_DIR"
+        # If an existing file lacks our marker, refuse to overwrite.
+        if [ -f "$RESOLVER_DIR/$suffix" ] && ! marked_file "$RESOLVER_DIR/$suffix"; then
+            die "refusing to overwrite unmarked $RESOLVER_DIR/$suffix"
+        fi
+        printf '%s\nnameserver %s\n' "$MARKER" "$ns" > "$RESOLVER_DIR/$suffix"
+        chmod 644 "$RESOLVER_DIR/$suffix"
+        ;;
+    delete-resolver)
+        suffix="${1:-}"
+        valid_suffix "$suffix" || die "invalid suffix: $suffix"
+        f="$RESOLVER_DIR/$suffix"
+        if [ -f "$f" ] && marked_file "$f"; then
+            rm -f "$f"
+        fi
+        ;;
+    cleanup-resolver)
+        [ -d "$RESOLVER_DIR" ] || exit 0
+        for f in "$RESOLVER_DIR"/*; do
+            [ -f "$f" ] || continue
+            if marked_file "$f"; then
+                rm -f "$f"
+            fi
+        done
+        ;;
+    list-resolver)
+        [ -d "$RESOLVER_DIR" ] || exit 0
+        for f in "$RESOLVER_DIR"/*; do
+            [ -f "$f" ] || continue
+            if marked_file "$f"; then
+                echo "${f##*/}"
+            fi
+        done
+        ;;
+    *)
+        cat >&2 <<USAGE
+splitroute-priv — privileged helper (run via sudo)
+  write-resolver  <suffix> <nameserver>
+  delete-resolver <suffix>
+  cleanup-resolver
+  list-resolver
+USAGE
+        exit 2
+        ;;
+esac

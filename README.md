@@ -80,16 +80,25 @@ No startup order required. The service starts automatically on login.
 ## Commands
 
 ```
-splitroute add <IP>       Add an IP or subnet to route through VPN
-splitroute remove <IP>    Remove an IP or subnet
-splitroute list           List all configured routes
-splitroute edit           Open config file in editor
-splitroute status         Show service, VPN, and route status
-splitroute test <IP>      Check how an IP is currently routed
-splitroute logs           Show recent log entries
-splitroute reload         Restart the background service
-splitroute uninstall      Uninstall splitroute
-splitroute help           Show all commands
+splitroute add <IP>              Add an IP or subnet to route through VPN
+splitroute remove <IP>           Remove an IP or subnet
+splitroute list                  List all configured routes
+splitroute edit                  Open config file in editor
+splitroute status                Show service, VPN, route, and PAC status
+splitroute test <IP>             Check how an IP is currently routed
+splitroute logs                  Show recent log entries
+splitroute reload                Restart the background service
+splitroute uninstall             Uninstall splitroute
+splitroute help                  Show all commands
+
+# Browser split routing (PAC) — see section below
+splitroute domain add <pattern>  Send a domain (e.g. *.company.com) through VPN
+splitroute domain remove <pat>   Remove a domain pattern
+splitroute domain list           List domain patterns
+splitroute dns add <sfx> [ns]    Map a DNS suffix to a nameserver (or 'auto')
+splitroute dns remove <sfx>      Remove a DNS override
+splitroute dns list              List DNS overrides
+splitroute pac [url|show|status] Inspect the PAC endpoint and file
 ```
 
 ## Configuration
@@ -142,6 +151,83 @@ Common proxy tool ports:
 
 > **Why?** When VPN connects, macOS creates a new network service for the tunnel. Your proxy tool only sets system proxy on Wi-Fi, not the VPN service. Proxy bridging tells splitroute to also set system proxy on the VPN service.
 
+## Browser Split Routing (PAC)
+
+> New in v1.3
+
+The route table works for anything that uses the OS socket layer (SSH, `curl`, `git`, native apps). **Browsers are different.** If you run a local proxy tool like Clash Verge with "system proxy" enabled, Chrome sends every request to the proxy — so splitroute's routes never get a chance to fire, and your internal company domains get tunneled through the wrong pipe.
+
+splitroute v1.3 solves this by serving a **PAC (Proxy Auto-Config)** file and registering it as the macOS system auto-proxy URL. The PAC tells the browser: "for company domains and IP ranges go `DIRECT` (which lets the OS routing table → splitroute → VPN), for everything else go through your existing proxy (Clash etc.)."
+
+Clash configuration is **not** modified.
+
+### Setup
+
+```bash
+# Domains whose traffic should go via VPN in the browser
+splitroute domain add '*.company.com'
+splitroute domain add '*.corp.internal'
+
+# Internal DNS override (so DIRECT hostnames resolve via VPN-pushed DNS).
+# 'auto' reads the nameserver from scutil --dns once VPN is connected.
+splitroute dns add company.com auto
+splitroute dns add corp.internal auto
+
+# Verify
+splitroute status
+splitroute pac show     # inspect generated PAC JavaScript
+splitroute doctor       # 7-step health check, incl. PAC server + autoproxy URL
+```
+
+That's it. The background service:
+
+- Generates `~/.splitroute/pac/proxy.pac` from your config
+- Runs a local HTTP server on `http://127.0.0.1:7899/proxy.pac` (Python's built-in `http.server`, bound to 127.0.0.1 only)
+- Sets `networksetup -setautoproxyurl` on every active network service (Wi-Fi, Ethernet, etc.) — and re-applies every 30 seconds so adapter switches are covered
+- Writes `/etc/resolver/<suffix>` entries when VPN connects; clears them on disconnect
+- Hot-reloads within ~30 seconds when you edit `~/.splitroute/splitroute.conf`
+- On `splitroute uninstall` (or `launchctl bootout`) restores every service's previous auto-proxy URL/state and removes its `/etc/resolver` files
+
+### How PAC routing flows
+
+```
+Chrome → system proxy → PAC FindProxyForURL(host):
+  host ~ *.company.com       → DIRECT → OS routing → splitroute VPN
+  host in 10.0.0.0/8         → DIRECT → OS routing → splitroute VPN
+  anything else              → PROXY 127.0.0.1:7890 (Clash etc.)
+```
+
+### When VPN is disconnected
+
+The PAC server and auto-proxy URL stay live; the PAC still routes non-company traffic through Clash so your browser keeps working. DIRECT rules for company domains will fail to resolve (internal DNS unreachable) — the intended outcome when you're off-VPN.
+
+### Privileged helper
+
+`/etc/resolver/<suffix>` management uses a small helper at `/usr/local/bin/splitroute-priv` (installed by the setup script). It is sudoers-granted NOPASSWD but strictly validates its inputs (DNS-safe suffix, IPv4 nameserver) and only touches files that carry its own marker header — so it cannot be tricked into writing or deleting arbitrary paths.
+
+### Config syntax
+
+```ini
+# ~/.splitroute/splitroute.conf — browser PAC section
+
+# Defaults (all optional):
+# pac_enabled = auto            # auto = on when any domain:/dns: line exists
+# pac_port = 7899
+# upstream_proxy =              # empty = auto-detect Clash (7890/7897/6152)
+# auto_set_system_proxy = true
+# manage_resolver = true
+
+domain: *.company.com
+domain: *.corp.internal
+
+# IP/CIDR rules (already used for routes) also feed PAC isInNet() rules.
+10.0.0.0/8
+172.16.0.0/12
+
+dns: company.com auto
+dns: corp.internal auto
+```
+
 ## Supported VPN Protocols
 
 | Protocol | Interface | Status |
@@ -185,12 +271,24 @@ splitroute test 10.0.1.100
 
 **Internal hostnames not resolving**
 
-splitroute handles routing only, not DNS. To resolve internal domains through VPN DNS:
+Since v1.3, splitroute can manage `/etc/resolver/*` for you:
+
+```bash
+splitroute dns add internal.company.com auto        # auto = use VPN-pushed DNS
+# or with an explicit nameserver:
+splitroute dns add internal.company.com 10.0.0.1
+```
+
+For the legacy manual approach:
 
 ```bash
 sudo mkdir -p /etc/resolver
 echo "nameserver 10.0.0.1" | sudo tee /etc/resolver/internal.company.com
 ```
+
+**Browser still going through Clash instead of VPN**
+
+Check `splitroute doctor` — step 7 verifies the PAC server is reachable and the auto-proxy URL is set on every active network service. If it reports a problem, `splitroute doctor --fix` re-applies. Also see `splitroute pac show` to inspect the generated PAC rules.
 
 **Proxy tool shows disconnected after VPN connects**
 

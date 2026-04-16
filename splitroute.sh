@@ -15,6 +15,14 @@ source "$SPLITROUTE_DIR/splitroute-lib.sh" 2>/dev/null || {
     exit 1
 }
 
+# Optional PAC subsystem modules (present in v1+). Keep tolerant so the CLI
+# still works on partial installs.
+for _mod in splitroute-pac.sh splitroute-sysproxy.sh splitroute-resolver.sh; do
+    # shellcheck source=/dev/null
+    [ -f "$SPLITROUTE_DIR/$_mod" ] && source "$SPLITROUTE_DIR/$_mod"
+done
+unset _mod
+
 get_version() {
     cat "$SPLITROUTE_DIR/VERSION" 2>/dev/null || echo "unknown"
 }
@@ -77,6 +85,35 @@ cmd_status() {
                     printf "    %-24s    (inactive)\n" "$entry"
                 fi
             done
+        fi
+
+        # PAC (browser split routing)
+        if type pac_is_enabled >/dev/null 2>&1 && pac_is_enabled; then
+            echo ""
+            local pac_running=no pac_pid=""
+            if pac_is_running; then
+                pac_running=yes
+                pac_pid=$(cat "$SPLITROUTE_PAC_PID" 2>/dev/null)
+            fi
+            echo "  PAC        enabled (port $PAC_PORT, ${#DOMAINS[@]} domain, ${#DNS_SUFFIXES[@]} dns)"
+            echo "    URL      $(pac_url)"
+            if [ "$pac_running" = "yes" ]; then
+                echo "    Server   running (pid $pac_pid)"
+            else
+                echo "    Server   not running"
+            fi
+            if [ "${#DOMAINS[@]}" -gt 0 ]; then
+                echo "    Domains:"
+                for d in "${DOMAINS[@]}"; do
+                    echo "      $d"
+                done
+            fi
+            if [ "${#DNS_SUFFIXES[@]}" -gt 0 ]; then
+                echo "    DNS:"
+                for i in $(seq 0 $((${#DNS_SUFFIXES[@]} - 1))); do
+                    echo "      ${DNS_SUFFIXES[$i]} -> ${DNS_NAMESERVERS[$i]}"
+                done
+            fi
         fi
     else
         echo ""
@@ -285,13 +322,25 @@ cmd_reload() {
 
 cmd_uninstall() {
     echo "=== Uninstalling splitroute ==="
-    # Stop service
+    # Stop service (SIGTERM to watch triggers full_teardown: sysproxy, PAC, resolver).
     local domain
     domain="gui/$(id -u)"
     launchctl bootout "$domain/$PLIST_LABEL" 2>/dev/null \
         || launchctl unload "$PLIST" 2>/dev/null || true
     launchd_wait_unload "$PLIST_LABEL" "$domain" || true
     rm -f "$PLIST"
+
+    # Belt-and-suspenders cleanup in case the trap didn't run.
+    if type sysproxy_revert >/dev/null 2>&1; then
+        sysproxy_revert 2>/dev/null || true
+    fi
+    if type pac_stop >/dev/null 2>&1; then
+        pac_stop 2>/dev/null || true
+    fi
+    if [ -x /usr/local/bin/splitroute-priv ]; then
+        sudo /usr/local/bin/splitroute-priv cleanup-resolver 2>/dev/null || true
+    fi
+
     # Backup config
     if [ -f "$CONF" ]; then
         cp "$CONF" "$HOME/.splitroute.conf.bak"
@@ -299,8 +348,9 @@ cmd_uninstall() {
     fi
     # Remove install directory
     rm -rf "$SPLITROUTE_DIR"
-    # Remove CLI and sudoers
+    # Remove CLI, privileged helper, and sudoers
     sudo rm -f /usr/local/bin/splitroute
+    sudo rm -f /usr/local/bin/splitroute-priv
     sudo rm -f /etc/sudoers.d/splitroute
     echo "Done"
 }
@@ -316,7 +366,7 @@ cmd_doctor() {
     local pass=0 fail=0 warn=0
 
     # 1. Daemon check
-    printf "  [1/6] Daemon .............. "
+    printf "  [1/7] Daemon .............. "
     if launchctl list 2>/dev/null | grep -q "$PLIST_LABEL"; then
         echo "running"
         pass=$((pass + 1))
@@ -330,7 +380,7 @@ cmd_doctor() {
     fi
 
     # 2. Config check
-    printf "  [2/6] Config .............. "
+    printf "  [2/7] Config .............. "
     if load_config "$CONF" 2>/dev/null && [ ${#ROUTE_IPS[@]} -gt 0 ]; then
         echo "ok (${#ROUTE_IPS[@]} routes)"
         pass=$((pass + 1))
@@ -345,7 +395,7 @@ cmd_doctor() {
     fi
 
     # 3. VPN check
-    printf "  [3/6] VPN ................. "
+    printf "  [3/7] VPN ................. "
     local vpn_if
     vpn_if=$(get_vpn_interface 2>/dev/null || true)
     if [ -n "$vpn_if" ]; then
@@ -358,7 +408,7 @@ cmd_doctor() {
     fi
 
     # 4. Route table verification
-    printf "  [4/6] Routes .............. "
+    printf "  [4/7] Routes .............. "
     if [ -z "$vpn_if" ] || [ ${#ROUTE_IPS[@]} -eq 0 ]; then
         echo "skipped (no VPN or no routes)"
         warn=$((warn + 1))
@@ -393,7 +443,7 @@ cmd_doctor() {
     fi
 
     # 5. Connectivity test (first route)
-    printf "  [5/6] Connectivity ........ "
+    printf "  [5/7] Connectivity ........ "
     if [ -z "$vpn_if" ] || [ ${#ROUTE_IPS[@]} -eq 0 ]; then
         echo "skipped"
         warn=$((warn + 1))
@@ -412,8 +462,8 @@ cmd_doctor() {
         fi
     fi
 
-    # 6. Proxy listener (only when proxy bridging is enabled)
-    printf "  [6/6] Proxy listener ...... "
+    # 6. Proxy listener (only when legacy proxy bridging is enabled)
+    printf "  [6/7] Proxy listener ...... "
     if [ "$PROXY_ENABLED" != "true" ]; then
         echo "skipped (proxy bridging disabled)"
         warn=$((warn + 1))
@@ -437,6 +487,49 @@ cmd_doctor() {
             echo "no listener on ${missing[*]}"
             fail=$((fail + 1))
             echo "        -> Start your proxy tool, or run 'splitroute edit' to adjust ports"
+        fi
+    fi
+
+    # 7. PAC server + autoproxy (only when PAC enabled)
+    printf "  [7/7] PAC server .......... "
+    if ! type pac_is_enabled >/dev/null 2>&1 || ! pac_is_enabled; then
+        echo "skipped (PAC disabled)"
+        warn=$((warn + 1))
+    else
+        local pac_ok=true
+        if ! pac_is_running; then
+            echo "server not running"
+            fail=$((fail + 1))
+            pac_ok=false
+        elif ! curl -fsS --max-time 1 "http://127.0.0.1:$PAC_PORT/proxy.pac" >/dev/null 2>&1; then
+            echo "server unreachable on $PAC_PORT"
+            fail=$((fail + 1))
+            pac_ok=false
+        fi
+        if $pac_ok; then
+            # Check at least one service has autoproxy pointing to us
+            local any_svc="" url_svc
+            while IFS= read -r svc; do
+                [ -n "$svc" ] || continue
+                url_svc=$(networksetup -getautoproxyurl "$svc" 2>/dev/null | awk -F': ' '/^URL:/{print $2}')
+                if [ "${url_svc%%\?*}" = "http://127.0.0.1:$PAC_PORT/proxy.pac" ]; then
+                    any_svc="$svc"
+                    break
+                fi
+            done < <(active_network_services)
+            if [ -n "$any_svc" ]; then
+                echo "ok (${#DOMAINS[@]} domain, ${#DNS_SUFFIXES[@]} dns)"
+                pass=$((pass + 1))
+            else
+                echo "autoproxy not set on any service"
+                fail=$((fail + 1))
+                if $fix; then
+                    echo "        -> Fixing: setting autoproxy URL"
+                    sysproxy_apply "$(pac_url)?v=$(pac_mtime)" >/dev/null 2>&1 || true
+                else
+                    echo "        -> Run: splitroute doctor --fix  (or: splitroute reload)"
+                fi
+            fi
         fi
     fi
 
@@ -466,6 +559,211 @@ cmd_apply() {
     fi
 }
 
+# --- domain ---
+
+_is_legacy_conf() {
+    [ -f "$CONF" ] && grep -q 'ROUTE_IPS=(' "$CONF" 2>/dev/null
+}
+
+_require_new_format() {
+    if _is_legacy_conf; then
+        echo "Your $CONF uses the legacy bash format, which does not support"
+        echo "domain/dns rules. Run 'splitroute edit' and convert to the new"
+        echo "simple format, or remove the legacy ROUTE_IPS=(...) block."
+        exit 1
+    fi
+}
+
+_ensure_conf() {
+    if [ ! -f "$CONF" ]; then
+        mkdir -p "$SPLITROUTE_DIR"
+        {
+            echo "# splitroute configuration"
+            echo ""
+            echo "interface = auto"
+            echo "proxy = false"
+            echo "http_port = 7890"
+            echo "socks_port = 7891"
+            echo ""
+            echo "# === Routes ==="
+        } > "$CONF"
+    fi
+}
+
+cmd_domain() {
+    local sub="${1:-list}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        add|a)        _cmd_domain_add "${1:-}" ;;
+        remove|rm|r)  _cmd_domain_remove "${1:-}" ;;
+        list|ls|"")   _cmd_domain_list ;;
+        *)
+            echo "Usage: splitroute domain {add|remove|list} [pattern]"
+            exit 1 ;;
+    esac
+}
+
+_cmd_domain_add() {
+    local pattern="${1:-}"
+    [ -z "$pattern" ] && { echo "Usage: splitroute domain add <pattern>"; exit 1; }
+    _require_new_format
+    _ensure_conf
+    load_config "$CONF" 2>/dev/null || true
+    local d
+    for d in "${DOMAINS[@]+"${DOMAINS[@]}"}"; do
+        if [ "$d" = "$pattern" ]; then
+            echo "Already present: $pattern"
+            exit 0
+        fi
+    done
+    echo "domain: $pattern" >> "$CONF"
+    echo "Added domain: $pattern"
+    echo "Takes effect within 30s (watch hot-reloads config)."
+}
+
+_cmd_domain_remove() {
+    local pattern="${1:-}"
+    [ -z "$pattern" ] && { echo "Usage: splitroute domain remove <pattern>"; exit 1; }
+    [ -f "$CONF" ] || { echo "No config file"; exit 1; }
+    _require_new_format
+    local tmp="$CONF.tmp.$$"
+    awk -v pat="$pattern" '
+        {
+            raw = $0
+            l = $0
+            sub(/#.*/, "", l)
+            gsub(/^[ \t]+|[ \t]+$/, "", l)
+            if (index(l, "domain:") == 1) {
+                val = substr(l, length("domain:") + 1)
+                gsub(/^[ \t]+|[ \t]+$/, "", val)
+                if (val == pat) next
+            }
+            print raw
+        }
+    ' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+    echo "Removed domain: $pattern"
+}
+
+_cmd_domain_list() {
+    load_config "$CONF" 2>/dev/null || { echo "No config"; return; }
+    if [ "${#DOMAINS[@]}" -eq 0 ]; then
+        echo "(no domain rules)"
+        return
+    fi
+    local d
+    for d in "${DOMAINS[@]}"; do
+        echo "$d"
+    done
+}
+
+# --- dns ---
+
+cmd_dns() {
+    local sub="${1:-list}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        add|a)        _cmd_dns_add "$@" ;;
+        remove|rm|r)  _cmd_dns_remove "${1:-}" ;;
+        list|ls|"")   _cmd_dns_list ;;
+        *)
+            echo "Usage: splitroute dns {add <suffix> [<ns>|auto] | remove <suffix> | list}"
+            exit 1 ;;
+    esac
+}
+
+_cmd_dns_add() {
+    local suffix="${1:-}" ns="${2:-auto}"
+    [ -z "$suffix" ] && { echo "Usage: splitroute dns add <suffix> [<ns>|auto]"; exit 1; }
+    _require_new_format
+    _ensure_conf
+    load_config "$CONF" 2>/dev/null || true
+    local i
+    for (( i = 0; i < ${#DNS_SUFFIXES[@]}; i++ )); do
+        if [ "${DNS_SUFFIXES[$i]}" = "$suffix" ]; then
+            echo "Already present: $suffix -> ${DNS_NAMESERVERS[$i]}"
+            exit 0
+        fi
+    done
+    echo "dns: $suffix $ns" >> "$CONF"
+    echo "Added dns: $suffix -> $ns"
+}
+
+_cmd_dns_remove() {
+    local suffix="${1:-}"
+    [ -z "$suffix" ] && { echo "Usage: splitroute dns remove <suffix>"; exit 1; }
+    [ -f "$CONF" ] || { echo "No config file"; exit 1; }
+    _require_new_format
+    local tmp="$CONF.tmp.$$"
+    awk -v pat="$suffix" '
+        {
+            raw = $0
+            l = $0
+            sub(/#.*/, "", l)
+            gsub(/^[ \t]+|[ \t]+$/, "", l)
+            if (index(l, "dns:") == 1) {
+                val = substr(l, length("dns:") + 1)
+                gsub(/^[ \t]+|[ \t]+$/, "", val)
+                n = index(val, " ")
+                if (n > 0) val = substr(val, 1, n - 1)
+                if (val == pat) next
+            }
+            print raw
+        }
+    ' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+    echo "Removed dns: $suffix"
+}
+
+_cmd_dns_list() {
+    load_config "$CONF" 2>/dev/null || { echo "No config"; return; }
+    if [ "${#DNS_SUFFIXES[@]}" -eq 0 ]; then
+        echo "(no dns rules)"
+        return
+    fi
+    local i
+    for (( i = 0; i < ${#DNS_SUFFIXES[@]}; i++ )); do
+        echo "${DNS_SUFFIXES[$i]} ${DNS_NAMESERVERS[$i]}"
+    done
+}
+
+# --- pac ---
+
+cmd_pac() {
+    local sub="${1:-status}"
+    case "$sub" in
+        url)
+            load_config "$CONF" 2>/dev/null || true
+            echo "$(pac_url)?v=$(pac_mtime)"
+            ;;
+        show|cat)
+            if [ -f "$SPLITROUTE_PAC_FILE" ]; then
+                cat "$SPLITROUTE_PAC_FILE"
+            else
+                echo "PAC file not generated yet: $SPLITROUTE_PAC_FILE"
+            fi
+            ;;
+        status|"")
+            load_config "$CONF" 2>/dev/null || true
+            if pac_is_enabled; then
+                echo "PAC:     enabled"
+                echo "URL:     $(pac_url)"
+                echo "File:    $SPLITROUTE_PAC_FILE"
+                if pac_is_running; then
+                    echo "Server:  running (pid $(cat "$SPLITROUTE_PAC_PID"))"
+                else
+                    echo "Server:  NOT running"
+                fi
+                echo "Domains: ${#DOMAINS[@]}"
+                echo "DNS:     ${#DNS_SUFFIXES[@]}"
+            else
+                echo "PAC disabled (add 'domain:' or 'dns:' lines to enable)"
+            fi
+            ;;
+        *)
+            echo "Usage: splitroute pac {url|show|status}"
+            exit 1 ;;
+    esac
+}
+
 # --- help ---
 
 cmd_help() {
@@ -476,23 +774,32 @@ cmd_help() {
     echo "Usage: splitroute <command>"
     echo ""
     echo "Getting started:"
-    echo "  add <IP>       Add an IP or subnet to route through VPN"
-    echo "  remove <IP>    Remove an IP or subnet from routes"
-    echo "  list           List all configured routes"
-    echo "  edit           Open config file in editor"
+    echo "  add <IP>              Add an IP or subnet to route through VPN"
+    echo "  remove <IP>           Remove an IP or subnet from routes"
+    echo "  list                  List all configured routes"
+    echo "  edit                  Open config file in editor"
+    echo ""
+    echo "Browser split routing (PAC):"
+    echo "  domain add <pat>      Add a domain pattern (e.g. *.company.com) to route via VPN"
+    echo "  domain remove <pat>   Remove a domain pattern"
+    echo "  domain list           List domain patterns"
+    echo "  dns add <suffix> [ns] Map an internal DNS suffix to a nameserver (or 'auto')"
+    echo "  dns remove <suffix>   Remove a DNS override"
+    echo "  dns list              List DNS overrides"
+    echo "  pac [url|show|status] Inspect the PAC endpoint and file"
     echo ""
     echo "Diagnostics:"
-    echo "  status         Show service, VPN, and route status"
-    echo "  doctor [--fix] Run 5-step diagnostic (optional auto-fix)"
-    echo "  test <IP>      Check how an IP is currently routed"
-    echo "  logs           Show recent log entries"
+    echo "  status                Show service, VPN, route, and PAC status"
+    echo "  doctor [--fix]        Run diagnostic (optional auto-fix)"
+    echo "  test <IP>             Check how an IP is currently routed"
+    echo "  logs                  Show recent log entries"
     echo ""
     echo "Management:"
-    echo "  apply          Manually inject routes now"
-    echo "  reload         Restart the background service"
-    echo "  uninstall      Uninstall splitroute"
-    echo "  version        Show version"
-    echo "  help           Show this help"
+    echo "  apply                 Manually inject routes now"
+    echo "  reload                Restart the background service"
+    echo "  uninstall             Uninstall splitroute"
+    echo "  version               Show version"
+    echo "  help                  Show this help"
     echo ""
     echo "Config: $CONF"
 }
@@ -512,6 +819,9 @@ case "${1:-help}" in
     version|--version|-v) cmd_version ;;
     reload)               cmd_reload ;;
     uninstall)            cmd_uninstall ;;
+    domain)               shift; cmd_domain "$@" ;;
+    dns)                  shift; cmd_dns "$@" ;;
+    pac)                  shift; cmd_pac "$@" ;;
     help|--help|-h)       cmd_help ;;
     *)                    echo "Unknown command: $1"; echo ""; cmd_help; exit 1 ;;
 esac

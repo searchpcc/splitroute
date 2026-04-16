@@ -31,20 +31,26 @@ mkdir -p "$INSTALL_DIR/bin"
 cp "$SCRIPT_DIR/splitroute-lib.sh" "$INSTALL_DIR/splitroute-lib.sh"
 cp "$SCRIPT_DIR/splitroute-routes.sh" "$INSTALL_DIR/splitroute-routes.sh"
 cp "$SCRIPT_DIR/splitroute-watch.sh" "$INSTALL_DIR/splitroute-watch.sh"
+# PAC subsystem (browser split routing)
+cp "$SCRIPT_DIR/splitroute-pac.sh" "$INSTALL_DIR/splitroute-pac.sh"
+cp "$SCRIPT_DIR/splitroute-sysproxy.sh" "$INSTALL_DIR/splitroute-sysproxy.sh"
+cp "$SCRIPT_DIR/splitroute-resolver.sh" "$INSTALL_DIR/splitroute-resolver.sh"
 cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
-chmod +x "$INSTALL_DIR/splitroute-lib.sh"
-chmod +x "$INSTALL_DIR/splitroute-routes.sh"
-chmod +x "$INSTALL_DIR/splitroute-watch.sh"
+chmod +x "$INSTALL_DIR"/splitroute-*.sh
 echo "  -> Installed to $INSTALL_DIR/"
 
-# Step 2: Install CLI
+# Step 2: Install CLI and privileged helper
 echo "[2/5] Installing CLI..."
 cp "$SCRIPT_DIR/splitroute.sh" "$INSTALL_DIR/bin/splitroute"
 chmod +x "$INSTALL_DIR/bin/splitroute"
 sudo mkdir -p /usr/local/bin
 sudo cp "$INSTALL_DIR/bin/splitroute" /usr/local/bin/splitroute
 sudo chmod +x /usr/local/bin/splitroute
-echo "  -> Installed splitroute command"
+# Privileged helper for /etc/resolver management (sudoers NOPASSWD)
+sudo cp "$SCRIPT_DIR/splitroute-priv" /usr/local/bin/splitroute-priv
+sudo chown root:wheel /usr/local/bin/splitroute-priv 2>/dev/null || true
+sudo chmod 755 /usr/local/bin/splitroute-priv
+echo "  -> Installed splitroute command + splitroute-priv helper"
 
 # Step 3: Create config file
 echo "[3/5] Configuring routes..."
@@ -117,19 +123,21 @@ else
     fi
 fi
 
-# Step 4: Passwordless sudo for route and networksetup
-# Note: This grants NOPASSWD for ALL subcommands of route and networksetup.
-# macOS sudoers does not support argument-level restrictions for these tools.
-# The scripts only use: route -n add/delete, networksetup -set*proxy*
+# Step 4: Passwordless sudo for route, networksetup, and splitroute-priv.
+# splitroute-priv validates its own inputs (strict regex on DNS suffixes + IPs)
+# and only touches /etc/resolver/<suffix> files carrying the splitroute marker.
+# That narrow surface is why it's safe to grant NOPASSWD for the whole binary
+# while /sbin/route and /usr/sbin/networksetup remain broadly scoped (macOS
+# sudoers can't reliably restrict their arguments).
 echo "[4/5] Configuring sudo..."
 SUDOERS_FILE="/etc/sudoers.d/splitroute"
-SUDOERS_LINE="$USERNAME ALL=(ALL) NOPASSWD: /sbin/route, /usr/sbin/networksetup"
-if sudo test -f "$SUDOERS_FILE"; then
-    echo "  -> $SUDOERS_FILE exists, skipped"
+SUDOERS_LINE="$USERNAME ALL=(ALL) NOPASSWD: /sbin/route, /usr/sbin/networksetup, /usr/local/bin/splitroute-priv"
+if sudo test -f "$SUDOERS_FILE" && sudo grep -qF "splitroute-priv" "$SUDOERS_FILE" 2>/dev/null; then
+    echo "  -> $SUDOERS_FILE up to date, skipped"
 else
     echo "$SUDOERS_LINE" | sudo tee "$SUDOERS_FILE" > /dev/null
     sudo chmod 0440 "$SUDOERS_FILE"
-    echo "  -> Configured passwordless route commands"
+    echo "  -> Configured passwordless route/networksetup/resolver commands"
 fi
 
 # Step 5: Install launchd plist

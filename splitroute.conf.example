@@ -1,16 +1,37 @@
 # splitroute configuration
-# Changes take effect on the next VPN connection. No restart needed.
+# Changes take effect within ~30s. No restart needed.
 
 # VPN interface detection (usually no need to change)
 # auto = detect automatically | ppp = L2TP only | utun = IKEv2/WireGuard only
 interface = auto
 
-# Proxy bridging (set to true if you use ClashX/Surge/Stash etc.)
+# Legacy proxy bridging (set to true if you want HTTP/SOCKS proxies set on the
+# VPN network service for apps that follow it). Independent of the PAC layer
+# below.
 proxy = false
 http_port = 7890
 socks_port = 7891
 
-# === Routes (one IP or subnet per line) ===
-# Add IPs/subnets below that should go through the VPN tunnel:
+# --- Browser split routing via PAC (v1.3+) ---
+# Uncomment to customize; defaults are suitable for most setups.
+#
+#   pac_enabled = auto              # auto = on when any domain:/dns: line exists
+#   pac_port = 7899
+#   upstream_proxy =                # empty = auto-detect Clash (7890/7897/6152)
+#   auto_set_system_proxy = true    # writes macOS auto-proxy URL on all services
+#   manage_resolver = true          # manages /etc/resolver/<suffix> files
+
+# === Routes (one IP or subnet per line) — any app's traffic to these goes via VPN ===
 # 10.0.1.100
 # 192.168.0.0/16
+
+# === Domains (PAC shExpMatch) — browser traffic to these goes via VPN ===
+# Requires DNS for these domains to be resolvable; see `dns:` below.
+# domain: *.company.com
+# domain: *.corp.internal
+
+# === Internal DNS overrides (written to /etc/resolver/<suffix>) ===
+# Format: dns: <suffix> [<nameserver-ip> | auto]
+# 'auto' reads the nameserver from scutil --dns once VPN is connected.
+# dns: company.com auto
+# dns: corp.internal 10.0.0.53
