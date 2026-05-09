@@ -102,16 +102,36 @@ PROXY_ENABLED=false
 
 ## Testing
 
-There is no automated test suite — the core logic depends on macOS system commands (`route`, `ifconfig`, `networksetup`) that can't be meaningfully tested in CI. ShellCheck catches syntax and common shell issues.
+A bats-based test suite covers the parts that don't require actual VPN/route-table state:
 
-Manual testing checklist:
-- [ ] `make install` works on a clean macOS
-- [ ] Interactive setup collects IPs and proxy settings correctly
-- [ ] `splitroute add/remove/list` manage config correctly
-- [ ] Routes added after VPN connects (`splitroute status`)
-- [ ] Routes cleaned up after VPN disconnects
-- [ ] `splitroute test <IP>` shows correct routing
-- [ ] Proxy bridging works when `proxy = true`
-- [ ] Proxy cleaned up after VPN disconnects
-- [ ] `splitroute uninstall` removes everything
-- [ ] Legacy config format (bash arrays) still works
+```bash
+# Install bats (one-time)
+brew install bats-core           # macOS
+# or: git clone https://github.com/bats-core/bats-core /tmp/bats-core && sudo /tmp/bats-core/install.sh /usr/local
+
+# Run all tests
+bats tests/
+
+# Run one file
+bats tests/cli_dispatcher.bats
+```
+
+What's covered:
+
+| File | Scope |
+|------|-------|
+| `tests/lib_helpers.bats` | `is_valid_route`, `is_valid_hostname`, `derive_parent_suffix`, `cidr_to_netmask`, `get_vpn_gateway` (with mocked `ifconfig`) |
+| `tests/config_loader.bats` | All `load_config` parsing paths: bare IPs, `host:`, `host: name ip`, `domain:`, `dns:`, comments, settings |
+| `tests/pac_generator.bats` | `pac_rewrite` JS output for every rule type |
+| `tests/priv_helper.bats` | `splitroute-priv` validation and atomic rewrites of `/etc/hosts` and `/etc/resolver/*` (sandboxed against fakes) |
+| `tests/cli_dispatcher.bats` | `splitroute add`/`remove` smart dispatcher, `--no-auto-dns` flag, orphan-DNS cleanup |
+
+CI runs the suite on Ubuntu and macOS via `.github/workflows/test.yml`.
+
+What's NOT covered (still requires manual smoke-test on a real macOS box with a real VPN):
+- [ ] `make install` end-to-end (launchd, sudoers, /etc/resolver)
+- [ ] Routes actually go via VPN after connect (`splitroute status`, `splitroute test`)
+- [ ] `splitroute doctor --fix` migrates legacy IFSCOPE'd routes
+- [ ] Routes/`/etc/hosts` cleaned up on `splitroute uninstall`
+- [ ] PAC URL applied to every active network service
+- [ ] Legacy config format (bash arrays) still loads

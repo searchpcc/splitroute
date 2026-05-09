@@ -1,6 +1,7 @@
 # splitroute
 
 [![ShellCheck](https://github.com/searchpcc/splitroute/actions/workflows/lint.yml/badge.svg)](https://github.com/searchpcc/splitroute/actions/workflows/lint.yml)
+[![Tests](https://github.com/searchpcc/splitroute/actions/workflows/test.yml/badge.svg)](https://github.com/searchpcc/splitroute/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-12%2B-black.svg)](https://www.apple.com/macos/)
 
@@ -80,26 +81,51 @@ splitroute status
 ## 常用命令
 
 ```
-splitroute add <IP>              添加一个 IP 或网段到 VPN 路由
-splitroute remove <IP>           从路由中移除
-splitroute list                  列出所有已配置的路由
+splitroute add <target>          智能添加 — IP / CIDR / 域名 / *.通配符 自动分发
+splitroute remove <target>       智能移除 — 同 add 的输入形式
+splitroute list                  列出所有已配置项
 splitroute edit                  用编辑器打开配置文件
 splitroute status                查看服务、VPN、路由和 PAC 状态
-splitroute test <IP>             检查某个 IP 当前的路由路径
+splitroute test <IP|hostname>    检查某个目标当前的路由路径
 splitroute logs                  查看最近的日志
 splitroute reload                重启后台服务
 splitroute uninstall             卸载
 splitroute help                  显示帮助
 
-# 浏览器分流（PAC），见下方章节
-splitroute domain add <pat|IP>   添加域名规则（如 *.company.com）或 IPv4/CIDR（仅浏览器经 PAC）
+# 显式子命令（智能 add/remove 已自动分发到这些）
+splitroute host add <hostname>   一条命令搞定：浏览器 + ssh/git/curl 都走 VPN
+splitroute host remove <name>    移除（顺带清理自动加的 dns 后缀）
+splitroute host list             列出所有 host 与当前解析到的 IP
+splitroute domain add <pat|IP>   *.通配符或 IPv4/CIDR（仅浏览器，纯 PAC）
 splitroute domain remove <pat>   移除域名规则或 PAC-only IP
 splitroute domain list           列出域名规则与 PAC-only IP
-splitroute dns add <sfx> [ns]    将一个 DNS 后缀映射到内网 DNS 服务器（或 'auto'）
+splitroute dns add <sfx> [ns]    将一个 DNS 后缀映射到内网 DNS（或 'auto'）
 splitroute dns remove <sfx>      移除 DNS 覆盖
 splitroute dns list              列出 DNS 覆盖
 splitroute pac [url|show|status] 查看 PAC 地址和生成文件
 ```
+
+### 一条命令搞定一个域名
+
+最常见的需求 —— 「让 `git.company.com` 在浏览器、git、ssh 三种场景下都走 VPN」—— `splitroute add` 会自动判断输入类型并配齐三层：
+
+```bash
+splitroute add git.company.com               # 浏览器 + ssh + git，全走 VPN
+splitroute add bastion.company.com           # SSH 跳板机走 VPN
+splitroute add git.company.com 10.0.1.5      # 同上，但把 IP 写死，跳过 DNS 解析
+splitroute add 10.20.0.0/16                  # 任意程序：整段 CIDR 走 VPN
+splitroute add '*.corp.internal'             # 仅浏览器 — 通配符 PAC
+```
+
+输入一个裸域名时，幕后会做三件事：
+
+1. PAC 加一条 `DIRECT`，浏览器对该域名绕过 Clash。
+2. 自动追加 `dns: <父域名> auto`（如尚未配置）—— 让 DIRECT 解析走 VPN 推送的 DNS。
+3. VPN 连上后，watch 循环用 VPN DNS 解析这个域名，把每个 A 记录加到路由表；之后周期性重解析，IP 变了自动更新。
+
+带 IP 的形式 (`splitroute add <hostname> <ip>`) 会跳过第 2 步，改为把一行带 splitroute 标记的记录写入 `/etc/hosts`，让系统本地直接解析。**适合 IP 固定且稳定的场景**：完全不依赖 VPN DNS 可达、VPN 一连上立刻可用、每次访问不再有 DNS 轮询。
+
+`splitroute remove git.company.com` 反向清理（如父域名 `dns:` 已无其他 host 占用则一并删除；带 IP 的 host 在下次 sync 时从 `/etc/hosts` 移除）。
 
 ## 配置
 

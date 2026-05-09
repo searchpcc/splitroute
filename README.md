@@ -1,6 +1,7 @@
 # splitroute
 
 [![ShellCheck](https://github.com/searchpcc/splitroute/actions/workflows/lint.yml/badge.svg)](https://github.com/searchpcc/splitroute/actions/workflows/lint.yml)
+[![Tests](https://github.com/searchpcc/splitroute/actions/workflows/test.yml/badge.svg)](https://github.com/searchpcc/splitroute/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-12%2B-black.svg)](https://www.apple.com/macos/)
 
@@ -80,26 +81,51 @@ No startup order required. The service starts automatically on login.
 ## Commands
 
 ```
-splitroute add <IP>              Add an IP or subnet to route through VPN
-splitroute remove <IP>           Remove an IP or subnet
-splitroute list                  List all configured routes
+splitroute add <target>          Smart add — IP, CIDR, hostname, or *.pattern
+splitroute remove <target>       Smart remove — same input forms as add
+splitroute list                  List everything currently configured
 splitroute edit                  Open config file in editor
 splitroute status                Show service, VPN, route, and PAC status
-splitroute test <IP>             Check how an IP is currently routed
+splitroute test <IP|hostname>    Check how a target is currently routed
 splitroute logs                  Show recent log entries
 splitroute reload                Restart the background service
 splitroute uninstall             Uninstall splitroute
 splitroute help                  Show all commands
 
-# Browser split routing (PAC) — see section below
-splitroute domain add <pat|IP>   Domain pattern (*.company.com) OR IPv4/CIDR for browser
-splitroute domain remove <pat>   Remove a domain pattern or PAC-only IP
-splitroute domain list           List domain patterns and PAC-only IPs
+# Explicit subcommands (the smart `add`/`remove` above already dispatch to these)
+splitroute host add <hostname>   Browser + ssh/git/curl via VPN, all in one step
+splitroute host remove <name>    Remove a hostname (and its auto-added dns suffix)
+splitroute host list             List hostnames and their currently resolved IPs
+splitroute domain add <pat|IP>   *.pattern or IPv4/CIDR for the browser only
+splitroute domain remove <pat>   Remove a pattern / PAC-only IP
+splitroute domain list           List patterns and PAC-only IPs
 splitroute dns add <sfx> [ns]    Map a DNS suffix to a nameserver (or 'auto')
 splitroute dns remove <sfx>      Remove a DNS override
 splitroute dns list              List DNS overrides
 splitroute pac [url|show|status] Inspect the PAC endpoint and file
 ```
+
+### One command per hostname
+
+For the common case — "make `git.company.com` go through VPN in browser, git, and ssh" — `splitroute add` figures out the layers for you:
+
+```bash
+splitroute add git.company.com               # browser + ssh + git, all via VPN
+splitroute add bastion.company.com           # ssh bastion via VPN
+splitroute add git.company.com 10.0.1.5      # same, but pin to a fixed IP — no DNS lookup at all
+splitroute add 10.20.0.0/16                  # any app: route the whole subnet via VPN
+splitroute add '*.corp.internal'             # browser only — wildcard PAC pattern
+```
+
+A bare hostname expands into three behind-the-scenes actions:
+
+1. PAC `DIRECT` rule — the browser bypasses Clash for this host.
+2. `dns: <parent_suffix> auto` if not already set — so DIRECT lookups use the VPN-pushed DNS.
+3. After VPN connects, the watch loop resolves the hostname over VPN DNS and installs `route -host` entries; it re-resolves periodically so DNS changes propagate without you running anything.
+
+If you pass a fixed IP (`splitroute add <hostname> <ip>`), step 2 is skipped and the watch loop instead writes a marker-tagged line to `/etc/hosts` so the hostname resolves locally. Best when the IP is known and stable: VPN DNS doesn't need to be reachable, the route comes up the moment VPN connects, and there's no DNS round-trip on every lookup.
+
+`splitroute remove git.company.com` reverses all of it (drops the auto-added `dns:` line if no other host still needs it; removes the `/etc/hosts` line on the next sync if the host was pinned).
 
 ## Configuration
 
