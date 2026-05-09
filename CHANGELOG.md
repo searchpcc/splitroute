@@ -2,6 +2,39 @@
 
 > 中文版：[CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)
 
+## [1.5.0] - 2026-05-10
+
+### Added
+
+- `splitroute add <hostname> --no-auto-dns` opt-out flag — skips the auto-derived `dns: <parent_suffix> auto` line. Use when you don't want the suffix's other subdomains to resolve through VPN DNS (e.g. parent domain has external services). Flag accepts any position in the argument list.
+- `splitroute doctor` extended from 7 to 8 steps. New step 5 surfaces `host:` resolution status, /etc/hosts sync, and per-IP route status. Step 4 now detects IFSCOPE'd routes (legacy installs) and offers `--fix` to migrate them. Step 3 surfaces VPN peer or "no distinct peer" so users can tell L2TP from utun protocols at a glance.
+- bats-based test suite under `tests/` covering lib helpers, config parser, PAC generator, the privileged helper, and the smart `add`/`remove` dispatcher (80 tests total). Runs on Ubuntu and macOS via new `.github/workflows/test.yml`.
+
+### Changed
+
+- Watch loop refactored around two reconcile functions: `reconcile_full` (runs on VPN-state transitions and config changes — rebuilds everything) and `reconcile_drift` (runs every 30 s — only re-applies actually-drifted state). Single dispatch point replaces the previous nested-loop logic. Behavior identical, code path much easier to reason about.
+- `get_vpn_gateway` (used by the IFSCOPE fix) now returns empty when the VPN's "peer" address equals the local address — the case for utun-based protocols (WireGuard, IKEv2 native). The peer-as-gateway trick only works for protocols with a distinct peer (L2TP/PPP, OpenVPN). The route-add path falls back to `-interface <vpn_if>` for utun, which is correct for those protocols since they don't add a CLONING default and so don't auto-IFSCOPE.
+
+### Fixed
+
+- **IFSCOPE'd route table entries that didn't actually catch traffic** (silent breakage of split tunneling on L2TP/PPP). When VPN's "Send all traffic" is disabled, macOS marks all `-interface ppp0`-style routes with the IFSCOPE flag, so they're only consulted for traffic already bound to ppp0 — generic apps (ssh, curl, git) fall through to the en0 default and never hit the tunnel. `splitroute status` reported `[OK]` because the route entries existed, but `route get <ip>` returned the en0 default. `splitroute-routes.sh` and `splitroute-hosts.sh` now install routes via the VPN peer IP as gateway (`route add -host <ip> <peer>`) instead of `-interface <vpn_if>` — the resulting entries are global, not IFSCOPE'd, and visible to every app. Existing IFSCOPE entries are deleted before re-add, so `splitroute reload` after upgrading transparently migrates the route table. Falls back to the old `-interface` form for VPN protocols that don't expose a peer address (rare).
+- New `get_vpn_gateway` helper in `splitroute-lib.sh` reads the peer IP from `ifconfig <iface>`'s `inet ... --> <peer>` line.
+
+### Changed
+
+- `splitroute uninstall` now asks before backing up your config (default Yes), and rotates any prior backup to a timestamped name (`~/.splitroute.conf.bak.YYYYmmdd-HHMMSS`) so successive uninstall cycles don't clobber the older save. Non-interactive runs preserve the prior always-backup behavior.
+- `splitroute-setup.sh` (a.k.a. `make install` / the curl-pipe installer) detects a `~/.splitroute.conf.bak` from a previous uninstall and offers to restore it before falling back to interactive setup or the template, with the backup's modification time shown so you can confirm it's the right save.
+
+### Added
+
+- **One-command-per-hostname** (`splitroute add <hostname>`): bare hostnames now expand into a single `host:` config entry that bundles all three layers — PAC `DIRECT` rule for the browser, an auto-derived `dns: <parent_suffix> auto` so DIRECT lookups use VPN-pushed DNS, and per-IP routes installed after the watch loop resolves the hostname over VPN DNS. Re-resolution runs every ~30s, so DNS changes are picked up without manual intervention. Replaces the previous three-step flow (`splitroute domain add` + `splitroute dns add` + `splitroute add <IP>`) for the common "make this hostname go through VPN everywhere" case.
+- **Pinned-IP hostnames** (`splitroute add <hostname> <ip>`): when the IP is known and stable, pass it directly to skip DNS entirely. The watch loop writes a marker-tagged line to `/etc/hosts` (via the existing `splitroute-priv` helper, gated by a new `hosts-sync` subcommand that only ever touches lines carrying the splitroute marker), and installs the route. No `dig`, no dependency on VPN DNS being up, route comes online the moment VPN connects.
+- `splitroute add` is now a smart dispatcher: IPv4/CIDR → route table; bare hostname → `host:` bundle; hostname + IP → pinned `host: name ip`; `*.pattern` → PAC-only `domain:`. `splitroute remove` mirrors the same input forms and tears down the auto-added `dns:` entry when the last host under a parent suffix is removed; `/etc/hosts` is re-synced from config on the next watch tick (and fully cleared on `splitroute uninstall`).
+- `splitroute host add/remove/list` — explicit subcommand surface; `host list` shows pinned IPs and dynamically-resolved IPs from the watch loop's state file.
+- `splitroute test` accepts hostnames in addition to IPs (resolves and checks each A record).
+- New module `splitroute-hosts.sh`: resolver loop, state file, route diff/cleanup, /etc/hosts sync. State persists in `~/.splitroute/state/hosts.state` so re-resolution can spot added/removed IPs across runs.
+- `splitroute-priv` gains `hosts-sync` (reads `ip<TAB>hostname` pairs from stdin, atomically rewrites only the marker-tagged block in `/etc/hosts`) and `hosts-cleanup` (removes all marker-tagged lines).
+
 ## [1.4.0] - 2026-04-17
 
 ### Added

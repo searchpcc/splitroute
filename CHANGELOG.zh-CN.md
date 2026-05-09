@@ -2,6 +2,39 @@
 
 > English version: [CHANGELOG.md](CHANGELOG.md)
 
+## [1.5.0] - 2026-05-10
+
+### 新增
+
+- `splitroute add <hostname> --no-auto-dns` 跳过自动派生 `dns: <父域名> auto` 的副作用。适用场景：父域名上还挂着不该走 VPN DNS 的公网服务，你只想让指定 hostname 走 VPN，DNS 自己管。flag 位置随便放。
+- `splitroute doctor` 从 7 步扩到 8 步。新增第 5 步 Hosts，检查 `host:` 项的解析状态、/etc/hosts 是否同步、每个 IP 的路由状态。第 4 步（Routes）现在会识别老版本 splitroute 留下的 IFSCOPE 路由并建议 `--fix` 迁移。第 3 步（VPN）显示对端地址或「无独立 peer」标记，方便区分 L2TP 和 utun 协议。
+- 基于 bats 的测试套件（`tests/` 目录），覆盖 lib 工具函数、config 解析器、PAC 生成器、特权 helper、智能 `add`/`remove` 分发器（80 个测试）。新 GitHub Actions workflow `.github/workflows/test.yml` 在 Ubuntu + macOS 上运行。
+
+### 改动
+
+- watch 循环重构为两个 reconcile 函数：`reconcile_full`（VPN 状态变化或 config 变化时跑一次完整应用）和 `reconcile_drift`（每 30 秒跑一次，只对真正漂移的部分动作）。单一 dispatch 入口替代之前嵌套的循环逻辑。行为不变，可读性大幅提升。
+- `get_vpn_gateway` 检测到 VPN「对端 == 本机」时返回空字符串（utun 协议 WireGuard / IKEv2 native 的常见特征）。peer-as-gateway 这招只对有独立对端的协议有效（L2TP/PPP、OpenVPN）。utun 协议自动 fallback 到 `-interface <vpn_if>`，因为这些协议本就不会加 CLONING 默认路由所以不会被 IFSCOPE 化。
+
+### 修复
+
+- **路由表里有条目但流量根本不走 VPN 的隐性故障**（L2TP/PPP 上 split tunneling 静默失效）。关闭「通过 VPN 发送所有流量」后，macOS 会给所有 `-interface ppp0` 形式的路由打 `IFSCOPE` 标记 —— 这种路由只对绑定到 ppp0 的流量可见，普通 app（ssh/curl/git）不绑定接口，就漏到 en0 默认网关。`splitroute status` 因为只看路由表里是否有这条记录，会误报 `[OK]`，但 `route get <ip>` 实际返回的是 en0。修复：`splitroute-routes.sh` 和 `splitroute-hosts.sh` 改为用 VPN peer IP 当 gateway（`route add -host <ip> <peer>`），不再用 `-interface <vpn_if>`，新路由不带 IFSCOPE，所有 app 都能命中。升级后 `splitroute reload` 会自动 delete + re-add 老的 IFSCOPE 路由，迁移无感。对于拿不到 peer 的 VPN 协议（少见），自动 fallback 到老的 `-interface` 形式。
+- 新增 `get_vpn_gateway` lib helper：从 `ifconfig <iface>` 的 `inet ... --> <peer>` 行读出对端 IP。
+
+### 改动
+
+- `splitroute uninstall` 现在会先问你是否备份配置（默认 Y），且如果已经有旧的 `~/.splitroute.conf.bak`，会先把它轮转成带时间戳的名字（`~/.splitroute.conf.bak.YYYYmmdd-HHMMSS`），避免反复 uninstall/reinstall 把更早的保存覆盖掉。非交互模式保持原本「总是备份」的行为。
+- `splitroute-setup.sh`（`make install` / curl 一键安装的脚本）现在会检测上次卸载留下的 `~/.splitroute.conf.bak`，**先问你要不要恢复**再走交互配置或模板路径。会显示备份的修改时间，方便你确认是不是想要的那份。
+
+### 新增
+
+- **一条命令搞定一个域名**（`splitroute add <hostname>`）：直接传入裸域名时，会写入一行 `host:` 配置，自动同时配齐三层 —— PAC 加 `DIRECT` 让浏览器绕过 Clash、自动派生 `dns: <父域名> auto` 让 DIRECT 解析走 VPN DNS、watch 循环用 VPN DNS 解析后注入每条 A 记录的路由。每 ~30s 重解析一次，DNS 变化自动跟进。替代原本三步走的常见场景（`splitroute domain add` + `splitroute dns add` + `splitroute add <IP>`）。
+- **固定 IP 域名**（`splitroute add <hostname> <ip>`）：IP 已知且稳定时，可以直接带 IP，让 splitroute 跳过 DNS 解析这一层。watch 循环会通过 `splitroute-priv` 的新 `hosts-sync` 子命令往 `/etc/hosts` 写一行带 splitroute 标记的记录（这个命令只允许改自己标记过的行），再装好路由。**完全不 dig**、**不依赖 VPN DNS 可达**、VPN 一连上立刻生效。
+- `splitroute add` 升级为智能分发：IPv4/CIDR 走路由表；裸域名走 `host:` 三层捆绑；裸域名 + IP 走固定 IP 模式；`*.通配符` 走纯 PAC 的 `domain:`。`splitroute remove` 对称支持同样的输入形式；当某父域名后缀下没有 host 时自动清理该后缀的 `dns:`；`/etc/hosts` 在下个 watch tick 会从配置重新 sync（卸载时则整体清空）。
+- 新增 `splitroute host add/remove/list`，显式子命令；`host list` 会同时显示「pinned」固定 IP 和 watch 循环动态解析到的 IP。
+- `splitroute test` 现在支持传入域名（自动解析并检查每条 A 记录的路径）。
+- 新模块 `splitroute-hosts.sh`：解析循环、状态文件、路由 diff/清理、/etc/hosts sync。状态保存在 `~/.splitroute/state/hosts.state`，跨重启可识别新增/失效的 IP。
+- `splitroute-priv` 新增两个子命令：`hosts-sync`（从 stdin 读 `ip<TAB>hostname` 对，原子重写 `/etc/hosts` 中带 splitroute 标记的那块）和 `hosts-cleanup`（移除所有标记行）。
+
 ## [1.4.0] - 2026-04-17
 
 ### 新增
