@@ -21,10 +21,17 @@ pac_rewrite() {
         echo "function FindProxyForURL(url, host) {"
         echo '  host = host.toLowerCase();'
 
-        # Domain rules (shExpMatch)
+        # Domain rules (shExpMatch). HOSTS bare-hostname entries are folded
+        # into the same shExpMatch list so an exact match returns DIRECT.
         if [ ${#DOMAINS[@]} -gt 0 ]; then
             for d in "${DOMAINS[@]}"; do
                 # Strip quotes that could break the JS string
+                d="${d//\"/}"
+                echo "  if (shExpMatch(host, \"$d\")) return \"DIRECT\";"
+            done
+        fi
+        if [ ${#HOSTS[@]} -gt 0 ]; then
+            for d in "${HOSTS[@]}"; do
                 d="${d//\"/}"
                 echo "  if (shExpMatch(host, \"$d\")) return \"DIRECT\";"
             done

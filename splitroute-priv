@@ -3,18 +3,21 @@
 #
 # Runs as root via /etc/sudoers.d/splitroute (NOPASSWD). Keeps the
 # privileged surface small: only manages /etc/resolver/<suffix> files
-# that carry the splitroute marker.
+# and /etc/hosts entries that carry the splitroute marker.
 #
 # Subcommands:
-#   write-resolver  <suffix> <nameserver>
-#   delete-resolver <suffix>
-#   cleanup-resolver                          # delete all marked files
-#   list-resolver                             # list marked files (for debug)
+#   write-resolver   <suffix> <nameserver>
+#   delete-resolver  <suffix>
+#   cleanup-resolver                              # delete all marked resolver files
+#   list-resolver                                 # list marked resolver files
+#   hosts-sync                                    # rewrite /etc/hosts marked lines from stdin pairs
+#   hosts-cleanup                                 # remove all marked /etc/hosts lines
 
 set -eu
 
 MARKER="# managed-by: splitroute"
 RESOLVER_DIR="/etc/resolver"
+HOSTS_FILE="/etc/hosts"
 
 die() {
     echo "splitroute-priv: $*" >&2
@@ -87,13 +90,53 @@ case "$cmd" in
             fi
         done
         ;;
+    hosts-sync)
+        # Read pairs from stdin: one "<ip>\t<hostname>" per line.
+        # Validate every pair before touching /etc/hosts; if any pair fails
+        # validation we abort without modifying the file.
+        pairs=()
+        while IFS= read -r raw; do
+            [ -n "$raw" ] || continue
+            ip="${raw%%	*}"
+            host="${raw#*	}"
+            valid_nameserver "$ip" || die "invalid IP in pair: $ip"
+            valid_suffix "$host"   || die "invalid hostname in pair: $host"
+            pairs+=("$ip	$host")
+        done
+
+        [ -f "$HOSTS_FILE" ] || die "$HOSTS_FILE not found"
+        tmp="$HOSTS_FILE.splitroute.$$"
+        # Strip prior managed lines (anything ending in our marker) and
+        # ensure the trailing newline isn't lost.
+        grep -v "${MARKER}\$" "$HOSTS_FILE" > "$tmp" || true
+        # Guarantee terminating newline before appending.
+        if [ -s "$tmp" ] && [ "$(tail -c 1 "$tmp")" != "" ]; then
+            printf '\n' >> "$tmp"
+        fi
+        for entry in "${pairs[@]+"${pairs[@]}"}"; do
+            ip="${entry%%	*}"
+            host="${entry#*	}"
+            printf '%s\t%s\t%s\n' "$ip" "$host" "$MARKER" >> "$tmp"
+        done
+        chmod 644 "$tmp"
+        mv -f "$tmp" "$HOSTS_FILE"
+        ;;
+    hosts-cleanup)
+        [ -f "$HOSTS_FILE" ] || exit 0
+        tmp="$HOSTS_FILE.splitroute.$$"
+        grep -v "${MARKER}\$" "$HOSTS_FILE" > "$tmp" || true
+        chmod 644 "$tmp"
+        mv -f "$tmp" "$HOSTS_FILE"
+        ;;
     *)
         cat >&2 <<USAGE
 splitroute-priv — privileged helper (run via sudo)
-  write-resolver  <suffix> <nameserver>
-  delete-resolver <suffix>
+  write-resolver   <suffix> <nameserver>
+  delete-resolver  <suffix>
   cleanup-resolver
   list-resolver
+  hosts-sync       (reads "ip<TAB>hostname" pairs from stdin)
+  hosts-cleanup
 USAGE
         exit 2
         ;;

@@ -66,21 +66,35 @@ fi
 # Wait for interface to stabilize after detection
 sleep 2
 
-VPN_GW=$(ifconfig "$VPN_IF" | grep 'inet ' | awk '{print $4}')
+VPN_GW=$(get_vpn_gateway "$VPN_IF")
 echo "$(log_ts): [v$VERSION] VPN interface=$VPN_IF gateway=$VPN_GW" >> "$LOG"
 
-# Add routes (supports host IPs and CIDR subnets)
-ROUTE_TABLE=$(netstat -rn)
+# Add routes (supports host IPs and CIDR subnets).
+#
+# We use the VPN peer (`VPN_GW`) as the gateway when it's available rather
+# than `-interface <vpn_if>`. On macOS, ppp/L2TP routes added with
+# `-interface` get the IFSCOPE flag set — they're only visible to traffic
+# already bound to the VPN interface, so generic apps (ssh, curl, etc.)
+# fall through to the en0 default and never hit the tunnel. Routing via
+# the peer IP produces a globally-visible host route.
+#
+# Existing entries are deleted before re-add so reloads after a splitroute
+# upgrade migrate stale IFSCOPE'd routes to the new form.
 for entry in "${ROUTE_IPS[@]}"; do
-    # Use fixed-string word-boundary matching to avoid regex and partial IP issues
-    if echo "$ROUTE_TABLE" | grep -qFw "$entry"; then
-        echo "$(log_ts): Route exists $entry -> $VPN_IF, skipped" >> "$LOG"
-    elif [[ "$entry" == */* ]]; then
-        sudo route -n add -net "$entry" -interface "$VPN_IF" 2>> "$LOG"
-        echo "$(log_ts): Added net route $entry -> $VPN_IF" >> "$LOG"
+    if [[ "$entry" == */* ]]; then
+        rtype="-net"
     else
-        sudo route -n add -host "$entry" -interface "$VPN_IF" 2>> "$LOG"
-        echo "$(log_ts): Added host route $entry -> $VPN_IF" >> "$LOG"
+        rtype="-host"
+    fi
+
+    sudo route -n delete "$rtype" "$entry" 2>/dev/null || true
+
+    if [ -n "$VPN_GW" ]; then
+        sudo route -n add "$rtype" "$entry" "$VPN_GW" 2>> "$LOG"
+        echo "$(log_ts): Added $rtype $entry via gw $VPN_GW (on $VPN_IF)" >> "$LOG"
+    else
+        sudo route -n add "$rtype" "$entry" -interface "$VPN_IF" 2>> "$LOG"
+        echo "$(log_ts): Added $rtype $entry -interface $VPN_IF (no peer IP — may be IFSCOPE'd)" >> "$LOG"
     fi
 done
 

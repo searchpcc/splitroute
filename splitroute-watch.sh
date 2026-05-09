@@ -1,6 +1,15 @@
 #!/bin/bash
-# splitroute-watch.sh — Monitor VPN connection and drive the splitroute stack
-# (routes + PAC + system auto-proxy + /etc/resolver). Kept alive by launchd.
+# splitroute-watch.sh — Monitor VPN state and reconcile every subsystem
+# (routes, PAC, system auto-proxy, /etc/resolver, /etc/hosts) to match the
+# config file. Kept alive by launchd.
+#
+# Architecture:
+#   - reconcile_full(vpn_if)  : runs on VPN transitions and config changes.
+#                               Re-installs everything from scratch.
+#   - reconcile_drift(vpn_if) : runs every 30s. Cheap idempotent checks —
+#                               only re-applies what's actually drifted.
+#   - The main loop watches three triggers (VPN-state change, config mtime,
+#     periodic timer) and dispatches the right reconcile.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROUTES_SCRIPT="$SCRIPT_DIR/splitroute-routes.sh"
@@ -13,10 +22,13 @@ source "$SCRIPT_DIR/splitroute-pac.sh"
 source "$SCRIPT_DIR/splitroute-sysproxy.sh"
 # shellcheck source=splitroute-resolver.sh
 source "$SCRIPT_DIR/splitroute-resolver.sh"
+# shellcheck source=splitroute-hosts.sh
+source "$SCRIPT_DIR/splitroute-hosts.sh"
 
 CONF="$SPLITROUTE_CONF"
 LOG="$SPLITROUTE_LOG"
 LAST_CONF_MTIME=0
+DRIFT_INTERVAL=30   # seconds between periodic drift checks
 
 get_conf_mtime() {
     [ -f "$CONF" ] || { echo 0; return; }
@@ -39,14 +51,15 @@ legacy_cleanup_proxy() {
     fi
 }
 
-# Full teardown on SIGTERM/SIGINT (launchd bootout, splitctl stop).
+# Full teardown on SIGTERM/SIGINT (launchd bootout, splitroute uninstall).
 full_teardown() {
-    echo "$(log_ts): vpn-watch stopping — tearing down PAC/sysproxy/resolver" >> "$LOG"
+    echo "$(log_ts): vpn-watch stopping — tearing down PAC/sysproxy/resolver/hosts" >> "$LOG"
     if [ "${AUTO_SET_SYSTEM_PROXY:-true}" = "true" ]; then
         sysproxy_revert 2>/dev/null || true
     fi
     pac_stop 2>/dev/null || true
     resolver_cleanup_all 2>/dev/null || true
+    hosts_teardown 2>/dev/null || true
     legacy_cleanup_proxy
     exit 0
 }
@@ -61,115 +74,122 @@ apply_pac_stack() {
     fi
 }
 
-# Reload config + re-sync PAC/resolver/sysproxy to match new rules.
-reload_stack() {
-    load_config "$CONF" 2>/dev/null || return 1
+# Tear down PAC stack when config disabled it (e.g. user removed all
+# domain:/host:/dns: lines).
+teardown_pac_stack() {
+    sysproxy_revert 2>/dev/null || true
+    pac_stop 2>/dev/null || true
+}
+
+# Full reconciliation — every subsystem rebuilt from scratch. Runs on
+# VPN-state transitions and config-file changes.
+reconcile_full() {
+    local vpn_if="${1:-}"
+    load_config "$CONF" 2>/dev/null || true
+
     if pac_is_enabled; then
-        pac_rewrite || true
-        if [ "${AUTO_SET_SYSTEM_PROXY:-true}" = "true" ]; then
-            sysproxy_apply "$(pac_url)?v=$(pac_mtime)"
-        fi
+        apply_pac_stack
+    else
+        teardown_pac_stack
+    fi
+
+    if [ -n "$vpn_if" ]; then
+        # ROUTE_IPS go via splitroute-routes.sh (subprocess).
+        bash "$ROUTES_SCRIPT" 2>> "$LOG" || true
+
         if resolver_is_enabled; then
-            local vif
-            vif=$(get_vpn_interface 2>/dev/null || true)
-            resolver_cleanup_all
-            [ -n "$vif" ] && resolver_apply "$vif"
+            resolver_cleanup_all 2>/dev/null || true
+            resolver_apply "$vpn_if"
         else
             resolver_cleanup_all 2>/dev/null || true
         fi
+
+        # host: entries — installs /etc/hosts pins + per-IP routes.
+        hosts_apply "$vpn_if" 2>/dev/null || true
     else
-        sysproxy_revert 2>/dev/null || true
-        pac_stop 2>/dev/null || true
+        # VPN down: stale /etc/resolver entries would time out lookups for
+        # internal suffixes, so clear them. /etc/hosts pins persist
+        # (they're user intent that re-activates on reconnect).
         resolver_cleanup_all 2>/dev/null || true
     fi
 }
 
-# --- startup ---
+# Periodic drift check — runs every $DRIFT_INTERVAL seconds. Only does
+# work when something actually drifted.
+reconcile_drift() {
+    local vpn_if="${1:-}"
+    load_config "$CONF" 2>/dev/null || true
+
+    # Re-apply PAC autoproxy across active services. Cheap; catches
+    # newly-added services (Wi-Fi -> Ethernet handoff, USB tethering, etc.).
+    if pac_is_enabled; then
+        if ! pac_is_running; then
+            echo "$(log_ts): PAC server not running, restarting" >> "$LOG"
+            apply_pac_stack
+        elif [ "${AUTO_SET_SYSTEM_PROXY:-true}" = "true" ]; then
+            sysproxy_apply "$(pac_url)?v=$(pac_mtime)"
+        fi
+    fi
+
+    if [ -n "$vpn_if" ]; then
+        # Re-install routes only if any are missing (cheap netstat check).
+        if [ "${#ROUTE_IPS[@]}" -gt 0 ] && ! verify_routes "$vpn_if"; then
+            echo "$(log_ts): Route drift detected on $vpn_if, re-applying" >> "$LOG"
+            bash "$ROUTES_SCRIPT" 2>> "$LOG" || true
+        fi
+        # hosts_apply diffs against state and only acts on real changes.
+        hosts_apply "$vpn_if" 2>/dev/null || true
+    fi
+}
+
+# --- main loop ---
+
 load_config "$CONF" 2>/dev/null || true
 LAST_CONF_MTIME=$(get_conf_mtime)
 echo "$(log_ts): vpn-watch started" >> "$LOG"
 if pac_is_enabled; then
     sysproxy_warn_if_conflict
-    apply_pac_stack
 fi
 
+tracked_if=$(get_vpn_interface 2>/dev/null || true)
+[ -n "$tracked_if" ] && \
+    echo "$(log_ts): VPN already up on $tracked_if at startup" >> "$LOG"
+reconcile_full "$tracked_if"
+last_drift_ts=$SECONDS
+
 while true; do
+    sleep 5
     current_if=$(get_vpn_interface 2>/dev/null || true)
-    if [ -n "$current_if" ]; then
+    cur_mtime=$(get_conf_mtime)
+
+    # Trigger 1: VPN state transition (connect / disconnect / iface change)
+    if [ "$current_if" != "$tracked_if" ]; then
+        echo "$(log_ts): VPN transition ${tracked_if:-<none>} -> ${current_if:-<none>}" >> "$LOG"
+        # On disconnect, release per-host state (OS auto-cleared the
+        # interface routes; we just clear our bookkeeping). /etc/hosts
+        # pins stay — they're user intent.
+        if [ -z "$current_if" ] && [ -n "$tracked_if" ]; then
+            hosts_release 2>/dev/null || true
+            legacy_cleanup_proxy
+        fi
         tracked_if="$current_if"
-        echo "$(log_ts): VPN detected on $tracked_if, applying routes" >> "$LOG"
-        if bash "$ROUTES_SCRIPT"; then
-            echo "$(log_ts): Routes applied successfully on $tracked_if" >> "$LOG"
-        else
-            echo "$(log_ts): WARNING: route script exited with error on $tracked_if" >> "$LOG"
-        fi
-
-        # PAC layer: now that VPN is up, write /etc/resolver entries (auto DNS works now).
-        if pac_is_enabled && resolver_is_enabled; then
-            resolver_apply "$tracked_if"
-        fi
-
-        # Inner loop: watch for disconnect / interface change / conf change.
-        local_tick=0
-        while true; do
-            sleep 5
-            current_if=$(get_vpn_interface 2>/dev/null || true)
-
-            if [ -z "$current_if" ]; then
-                echo "$(log_ts): VPN disconnected (was $tracked_if)" >> "$LOG"
-                legacy_cleanup_proxy
-                resolver_cleanup_all 2>/dev/null || true
-                break
-            fi
-
-            if [ "$current_if" != "$tracked_if" ]; then
-                echo "$(log_ts): Interface changed $tracked_if -> $current_if, re-applying" >> "$LOG"
-                tracked_if="$current_if"
-                bash "$ROUTES_SCRIPT" || true
-                if pac_is_enabled && resolver_is_enabled; then
-                    resolver_cleanup_all
-                    resolver_apply "$tracked_if"
-                fi
-                local_tick=0
-            fi
-
-            local_tick=$((local_tick + 1))
-            if [ "$local_tick" -ge 6 ]; then
-                local_tick=0
-
-                # Hot reload on config change
-                cur_mtime=$(get_conf_mtime)
-                if [ "$cur_mtime" != "$LAST_CONF_MTIME" ]; then
-                    echo "$(log_ts): config changed (mtime $LAST_CONF_MTIME -> $cur_mtime), reloading" >> "$LOG"
-                    LAST_CONF_MTIME="$cur_mtime"
-                    reload_stack
-                fi
-
-                # Route verification (existing behavior)
-                load_config "$CONF" 2>/dev/null || true
-                if [ "${#ROUTE_IPS[@]}" -gt 0 ] && ! verify_routes "$tracked_if"; then
-                    echo "$(log_ts): Route verification failed on $tracked_if, re-applying" >> "$LOG"
-                    bash "$ROUTES_SCRIPT" || true
-                fi
-
-                # Catch newly-added network services for PAC autoproxy
-                if pac_is_enabled && [ "${AUTO_SET_SYSTEM_PROXY:-true}" = "true" ]; then
-                    sysproxy_apply "$(pac_url)?v=$(pac_mtime)"
-                fi
-            fi
-        done
-    else
-        # VPN off: still keep PAC/sysproxy alive + track config
-        cur_mtime=$(get_conf_mtime)
-        if [ "$cur_mtime" != "$LAST_CONF_MTIME" ]; then
-            echo "$(log_ts): config changed (VPN off), reloading" >> "$LOG"
-            LAST_CONF_MTIME="$cur_mtime"
-            reload_stack
-        fi
-        if pac_is_enabled && ! pac_is_running; then
-            echo "$(log_ts): PAC server not running, restarting" >> "$LOG"
-            apply_pac_stack
-        fi
+        reconcile_full "$tracked_if"
+        last_drift_ts=$SECONDS
+        continue
     fi
-    sleep 3
+
+    # Trigger 2: config file changed (hot-reload)
+    if [ "$cur_mtime" != "$LAST_CONF_MTIME" ]; then
+        echo "$(log_ts): config changed (mtime $LAST_CONF_MTIME -> $cur_mtime), reconciling" >> "$LOG"
+        LAST_CONF_MTIME="$cur_mtime"
+        reconcile_full "$tracked_if"
+        last_drift_ts=$SECONDS
+        continue
+    fi
+
+    # Trigger 3: periodic drift check
+    if [ "$((SECONDS - last_drift_ts))" -ge "$DRIFT_INTERVAL" ]; then
+        reconcile_drift "$tracked_if"
+        last_drift_ts=$SECONDS
+    fi
 done

@@ -35,6 +35,7 @@ cp "$SCRIPT_DIR/splitroute-watch.sh" "$INSTALL_DIR/splitroute-watch.sh"
 cp "$SCRIPT_DIR/splitroute-pac.sh" "$INSTALL_DIR/splitroute-pac.sh"
 cp "$SCRIPT_DIR/splitroute-sysproxy.sh" "$INSTALL_DIR/splitroute-sysproxy.sh"
 cp "$SCRIPT_DIR/splitroute-resolver.sh" "$INSTALL_DIR/splitroute-resolver.sh"
+cp "$SCRIPT_DIR/splitroute-hosts.sh" "$INSTALL_DIR/splitroute-hosts.sh"
 cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
 chmod +x "$INSTALL_DIR"/splitroute-*.sh
 echo "  -> Installed to $INSTALL_DIR/"
@@ -54,9 +55,26 @@ echo "  -> Installed splitroute command + splitroute-priv helper"
 
 # Step 3: Create config file
 echo "[3/5] Configuring routes..."
+BACKUP_PATH="$USER_HOME/.splitroute.conf.bak"
 if [ -f "$CONF" ]; then
     echo "  -> $CONF exists, keeping current config"
 else
+    # If a previous uninstall left a backup, offer to restore it before
+    # falling back to interactive setup or the template.
+    if [ -t 0 ] && [ -f "$BACKUP_PATH" ]; then
+        BACKUP_MTIME=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$BACKUP_PATH" 2>/dev/null || echo unknown)
+        echo ""
+        echo "  Found a previous config backup:"
+        echo "    $BACKUP_PATH  (saved $BACKUP_MTIME)"
+        read -rp "  Restore it? [Y/n]: " restore_reply
+        restore_reply="${restore_reply:-y}"
+        if [[ "$restore_reply" =~ ^[Yy] ]]; then
+            cp "$BACKUP_PATH" "$CONF"
+            echo "  -> Restored config from backup"
+        fi
+    fi
+fi
+if [ ! -f "$CONF" ]; then
     # Interactive setup if running in a terminal
     if [ -t 0 ]; then
         echo ""
@@ -173,8 +191,9 @@ echo "  1. Connect your VPN"
 echo "  2. Run: splitroute status"
 echo ""
 echo "Manage routes:"
-echo "  splitroute add 10.0.1.100"
-echo "  splitroute add 192.168.0.0/16"
+echo "  splitroute add 10.0.1.100               # IP / CIDR via route table"
+echo "  splitroute add git.example.com          # hostname: browser + ssh + git via VPN"
+echo "  splitroute add '*.corp.internal'        # browser-only PAC pattern"
 echo "  splitroute list"
 echo ""
 echo "All commands: splitroute help"

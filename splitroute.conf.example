@@ -25,8 +25,24 @@ socks_port = 7891
 # 10.0.1.100
 # 192.168.0.0/16
 
+# === Hosts (browser + ssh/git/curl, all via VPN) ===
+# `splitroute add git.company.com` writes one of these. The watch loop:
+#   * adds it to the PAC DIRECT list (browser)
+#   * auto-adds dns: <parent_suffix> auto (so DIRECT lookups use VPN DNS)
+#   * resolves the hostname over VPN DNS and installs per-IP routes
+#   * re-resolves periodically and updates routes if IPs change
+# host: git.company.com
+# host: bastion.company.com
+#
+# Add a fixed IP to pin the hostname via /etc/hosts and skip DNS entirely.
+# Useful when the IP is stable and you'd rather not depend on VPN DNS at all.
+# `splitroute add git.company.com 10.0.1.5` writes one of these.
+# host: git.company.com 10.0.1.5
+# host: bastion.company.com 10.0.1.6
+
 # === Domains (PAC shExpMatch) — browser traffic to these goes via VPN ===
-# Requires DNS for these domains to be resolvable; see `dns:` below.
+# Use this when you want a wildcard pattern. Requires DNS for these domains
+# to be resolvable; see `dns:` below.
 # domain: *.company.com
 # domain: *.corp.internal
 #
@@ -41,5 +57,7 @@ socks_port = 7891
 # === Internal DNS overrides (written to /etc/resolver/<suffix>) ===
 # Format: dns: <suffix> [<nameserver-ip> | auto]
 # 'auto' reads the nameserver from scutil --dns once VPN is connected.
+# `splitroute add <hostname>` auto-adds the parent suffix here, so you usually
+# don't need to manage these by hand.
 # dns: company.com auto
 # dns: corp.internal 10.0.0.53

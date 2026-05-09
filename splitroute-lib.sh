@@ -11,6 +11,7 @@ SPLITROUTE_PAC_DIR="$SPLITROUTE_DIR/pac"
 SPLITROUTE_PAC_FILE="$SPLITROUTE_PAC_DIR/proxy.pac"
 SPLITROUTE_PAC_PID="$SPLITROUTE_DIR/pac.pid"
 SPLITROUTE_STATE_DIR="$SPLITROUTE_DIR/state"
+SPLITROUTE_HOSTS_STATE="$SPLITROUTE_STATE_DIR/hosts.state"
 SPLITROUTE_RESOLVER_MARKER="# managed-by: splitroute"
 
 # Formatted timestamp for log entries
@@ -60,8 +61,8 @@ trim() {
 
 # Load config file (supports both new simple format and legacy bash format)
 # Sets: ROUTE_IPS, VPN_INTERFACE, PROXY_ENABLED, HTTP_PORT, SOCKS_PORT,
-#       DOMAINS, DOMAIN_IPS, DNS_SUFFIXES, DNS_NAMESERVERS, PAC_ENABLED, PAC_PORT,
-#       UPSTREAM_PROXY, MANAGE_RESOLVER, AUTO_SET_SYSTEM_PROXY
+#       DOMAINS, DOMAIN_IPS, HOSTS, DNS_SUFFIXES, DNS_NAMESERVERS, PAC_ENABLED,
+#       PAC_PORT, UPSTREAM_PROXY, MANAGE_RESOLVER, AUTO_SET_SYSTEM_PROXY
 load_config() {
     local conf="${1:-$SPLITROUTE_CONF}"
 
@@ -75,9 +76,11 @@ load_config() {
     # PAC subsystem defaults (v1: browser-friendly split routing via PAC)
     DOMAINS=()
     DOMAIN_IPS=()        # IPv4/CIDR declared via `domain:` — PAC isInNet only, no route
+    HOSTS=()             # bare hostnames declared via `host:` — PAC + DNS + route bundle
+    HOST_FIXED_IPS=()    # parallel to HOSTS; empty string = resolve dynamically over VPN DNS
     DNS_SUFFIXES=()
     DNS_NAMESERVERS=()   # parallel to DNS_SUFFIXES (value may be "auto")
-    PAC_ENABLED="auto"   # auto = enabled when at least one domain/dns line is present
+    PAC_ENABLED="auto"   # auto = enabled when at least one domain/dns/host line is present
     PAC_PORT="7899"
     UPSTREAM_PROXY=""    # empty = auto-detect at runtime
     MANAGE_RESOLVER="true"
@@ -130,6 +133,21 @@ load_config() {
             fi
             continue
         fi
+        if [[ "$line" == host:* ]]; then
+            rest="$(trim "${line#host:}")"
+            if [ -n "$rest" ]; then
+                # "host: name [ip]" — second token is an optional explicit IPv4.
+                local hname hip
+                hname="${rest%%[[:space:]]*}"
+                hip="$(trim "${rest#"$hname"}")"
+                if [ -n "$hip" ] && ! is_valid_route "$hip"; then
+                    hip=""
+                fi
+                HOSTS+=("$hname")
+                HOST_FIXED_IPS+=("$hip")
+            fi
+            continue
+        fi
 
         if [[ "$line" == *=* ]]; then
             key="$(trim "${line%%=*}")"
@@ -150,9 +168,10 @@ load_config() {
         fi
     done < "$conf"
 
-    # Resolve PAC_ENABLED=auto → true when any domain/domain-ip/dns rule is present
+    # Resolve PAC_ENABLED=auto → true when any domain/domain-ip/host/dns rule is present
     if [ "$PAC_ENABLED" = "auto" ]; then
-        if [ ${#DOMAINS[@]} -gt 0 ] || [ ${#DOMAIN_IPS[@]} -gt 0 ] || [ ${#DNS_SUFFIXES[@]} -gt 0 ]; then
+        if [ ${#DOMAINS[@]} -gt 0 ] || [ ${#DOMAIN_IPS[@]} -gt 0 ] \
+            || [ ${#HOSTS[@]} -gt 0 ] || [ ${#DNS_SUFFIXES[@]} -gt 0 ]; then
             PAC_ENABLED="true"
         else
             PAC_ENABLED="false"
@@ -303,6 +322,33 @@ is_valid_route() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]
 }
 
+# Validate a bare hostname (no wildcards, no scheme, no path).
+# DNS-safe per RFC 1035: dot-separated labels, alnum/hyphen, must contain a dot.
+is_valid_hostname() {
+    local h="$1"
+    [ -n "$h" ] || return 1
+    [[ "$h" == *.* ]] || return 1
+    [[ "$h" == *[*?\!/\\\:\ ]* ]] && return 1
+    [[ "$h" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,252}[a-zA-Z0-9])?$ ]] || return 1
+    [[ "$h" == *..* ]] && return 1
+    return 0
+}
+
+# Derive a parent DNS suffix from a hostname (last two labels).
+# `git.dev.addnewer.com` -> `addnewer.com`
+# `git.addnewer.com`     -> `addnewer.com`
+# Returns 1 if input has fewer than two labels.
+derive_parent_suffix() {
+    local h="$1"
+    local last1 rest last2
+    [[ "$h" == *.* ]] || return 1
+    last1="${h##*.}"
+    rest="${h%.*}"
+    [[ "$rest" == *.* ]] || { echo "$h"; return 0; }
+    last2="${rest##*.}"
+    echo "$last2.$last1"
+}
+
 # Return current VPN interface name (e.g. utun3, ppp0), or empty if none.
 # Checks ppp first, then scutil, then utun with P2P heuristic.
 get_vpn_interface() {
@@ -328,6 +374,37 @@ get_vpn_interface() {
         return 0
     fi
     return 1
+}
+
+# Read the VPN peer (point-to-point destination) IP from a VPN interface,
+# but ONLY if it's a meaningful gateway — distinct from the local address.
+#
+# Output cases:
+#   L2TP/PPP / OpenVPN-with-distinct-peer:
+#       `inet 192.168.201.91 --> 192.168.1.1`     -> echo "192.168.1.1"
+#   WireGuard / IKEv2 native (peer = self):
+#       `inet 10.0.0.5 --> 10.0.0.5`              -> echo ""  (caller falls back to -interface)
+#   No P2P address at all:
+#       `inet 10.0.0.5 netmask 0xff000000`        -> echo ""
+#
+# Caller uses non-empty output as `route add <ip> <peer>` to dodge macOS's
+# IFSCOPE flag (which `-interface ppp0`-style routes inherit on L2TP and
+# makes them invisible to traffic not bound to the VPN interface). When
+# peer == self, that trick doesn't work — the route would loop — so we
+# return empty and let the caller use `-interface`. For utun-based
+# protocols (WireGuard, IKEv2 native) IFSCOPE is typically not set on
+# `-interface` routes, so the fallback behaves correctly.
+get_vpn_gateway() {
+    local vpn_if="$1"
+    [ -n "$vpn_if" ] || return 1
+    local local_ip peer
+    read -r local_ip peer < <(
+        ifconfig "$vpn_if" 2>/dev/null \
+            | awk '$1=="inet" && $3=="-->" {print $2, $4; exit}'
+    )
+    if [ -n "$peer" ] && [ -n "$local_ip" ] && [ "$peer" != "$local_ip" ]; then
+        echo "$peer"
+    fi
 }
 
 # Verify that at least one configured route exists on the given interface.
