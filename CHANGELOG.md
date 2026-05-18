@@ -2,6 +2,12 @@
 
 > 中文版：[CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)
 
+## [1.5.1] - 2026-05-19
+
+### Fixed
+
+- **PAC upstream proxy now updates without a restart or VPN transition.** Previously, `detect_upstream_proxy` ran only inside `reconcile_full` (VPN-state transitions / config-file edits), so the PAC file's `PROXY <host:port>` line was frozen at the moment of the last reconcile. Consequences: starting splitroute before Clash Verge / ClashX / Surge — PAC writes `return "DIRECT"`, every PAC-aware browser request bypasses the upstream proxy until VPN reconnects or the config is edited; switching proxy tool (e.g. Clash Verge → Surge) or restarting Clash on a different port — PAC keeps pointing at the now-dead port. `reconcile_drift` now re-runs the same probe on every 30s tick and rewrites the PAC file only when the detected upstream differs from the last applied value. State is persisted to `~/.splitroute/state/last_upstream` so the comparison stays robust across watch restarts. No config or behavior changes for users whose proxy tool starts before splitroute — the only difference is that the reverse startup order (and proxy-tool reconfigurations) now self-heal within 30 seconds.
+
 ## [1.5.0] - 2026-05-10
 
 ### Added

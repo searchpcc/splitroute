@@ -2,6 +2,12 @@
 
 > English version: [CHANGELOG.md](CHANGELOG.md)
 
+## [1.5.1] - 2026-05-19
+
+### 修复
+
+- **PAC 上游代理现在不需要重启或等 VPN 切换就能自动更新。** 之前 `detect_upstream_proxy` 只在 `reconcile_full`（VPN 状态变化 / 配置文件修改）里跑一次，所以 PAC 文件里的 `PROXY <host:port>` 那行被冻结在上次 reconcile 的瞬间。后果：splitroute 先于 Clash Verge / ClashX / Surge 启动 —— PAC 写成 `return "DIRECT"`，浏览器到下次 VPN 重连或改配置之前都绕过上游代理；切换代理工具（如 Clash Verge → Surge）或 Clash 换端口重启 —— PAC 仍然指着已经死掉的端口。`reconcile_drift` 现在每 30 秒重新探测一次，只有探测结果和上次应用的值不一致时才重写 PAC。状态持久化在 `~/.splitroute/state/last_upstream`，watch 重启后依然可靠。对"代理工具先启动、splitroute 后启动"的常见用户没有任何配置或行为变化 —— 唯一区别是反向启动顺序（以及代理工具中途重配）现在能在 30 秒内自愈。
+
 ## [1.5.0] - 2026-05-10
 
 ### 新增
