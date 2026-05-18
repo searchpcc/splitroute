@@ -126,8 +126,23 @@ reconcile_drift() {
         if ! pac_is_running; then
             echo "$(log_ts): PAC server not running, restarting" >> "$LOG"
             apply_pac_stack
-        elif [ "${AUTO_SET_SYSTEM_PROXY:-true}" = "true" ]; then
-            sysproxy_apply "$(pac_url)?v=$(pac_mtime)"
+        else
+            # Drift check: upstream proxy may have appeared/disappeared/changed
+            # since last pac_rewrite (e.g. user started Clash after splitroute,
+            # or switched proxy tool). Re-detect and rewrite PAC if it changed.
+            local detected_upstream last_upstream upstream_state_file
+            upstream_state_file="$SPLITROUTE_STATE_DIR/last_upstream"
+            detected_upstream=$(detect_upstream_proxy 2>/dev/null || echo "")
+            last_upstream=$(cat "$upstream_state_file" 2>/dev/null || echo "")
+            if [ "$detected_upstream" != "$last_upstream" ]; then
+                echo "$(log_ts): drift: upstream proxy changed '${last_upstream:-<none>}' -> '${detected_upstream:-<none>}', regenerating PAC" >> "$LOG"
+                pac_rewrite || true
+                mkdir -p "$SPLITROUTE_STATE_DIR"
+                printf '%s' "$detected_upstream" > "$upstream_state_file"
+            fi
+            if [ "${AUTO_SET_SYSTEM_PROXY:-true}" = "true" ]; then
+                sysproxy_apply "$(pac_url)?v=$(pac_mtime)"
+            fi
         fi
     fi
 
